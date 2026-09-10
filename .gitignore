@@ -26,10 +26,13 @@ venv/
 # 日志
 *.log
 
-# ─── C 模块（本地独有，wind/ 镜像之外的内容不入库）───
+# ─── C 模块（本地独有）───
 # 工程顶层零散工具和文件
-JCom.exe
-NetAssist.exe
-*.lnk
-scada/
-大作业备忘录.docx
+# 注意：必须用前导 "/" 锚定到仓库根目录！
+# 裸写 "scada/" 会匹配任意层级的同名目录，导致 wind/scada/（上位机源码）
+# 被一并忽略 —— 真正要排除的只是根目录下 A 那份 scada/ 副本。
+/JCom.exe
+/NetAssist.exe
+/*.lnk
+/scada/
+/大作业备忘录.docx
