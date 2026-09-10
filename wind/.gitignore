@@ -1,0 +1,48 @@
+# wind/.gitignore
+# ──────────────────────────────────────────────
+# 学生 C 风电子站：上位机 + STM32 固件
+# 局部 .gitignore — 只对 wind/ 子目录生效
+# ──────────────────────────────────────────────
+
+# 上位机 Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+
+# 上位机运行时数据 (不入库)
+db/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# STM32CubeIDE 编译产物
+Debug/
+Release/
+*.o
+*.d
+*.crunch
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.su
+*.dep
+
+# 备份文件
+*.bak
+*.bak.*
+*.tmp
+*.swp
+
+# 系统临时文件
+.DS_Store
+Thumbs.db
+desktop.ini
