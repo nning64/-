@@ -1,12 +1,4 @@
-# 03simulator 顶层 .gitignore
-# ──────────────────────────────────────────────
-# 顶层规则：合并自 远程 A 的 .gitignore + 学生 C 本地独有
-# 与 wind/.gitignore 各司其职：顶层管工程根目录的零散项，
-#                          wind/.gitignore 管 wind/ 子树内的细节。
-# ──────────────────────────────────────────────
-
-# ─── A 模块（远程已有）───
-# 数据库
+# 数据库文件
 grid.db
 grid.db-shm
 grid.db-wal
@@ -19,20 +11,9 @@ __pycache__/
 venv/
 .venv/
 
-# IDE
+# IDE 配置
 .idea/
 .vscode/
 
 # 日志
 *.log
-
-# ─── C 模块（本地独有）───
-# 工程顶层零散工具和文件
-# 注意：必须用前导 "/" 锚定到仓库根目录！
-# 裸写 "scada/" 会匹配任意层级的同名目录，导致 wind/scada/（上位机源码）
-# 被一并忽略 —— 真正要排除的只是根目录下 A 那份 scada/ 副本。
-/JCom.exe
-/NetAssist.exe
-/*.lnk
-/scada/
-/大作业备忘录.docx
