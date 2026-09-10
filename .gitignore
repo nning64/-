@@ -1,0 +1,19 @@
+# 数据库文件
+grid.db
+grid.db-shm
+grid.db-wal
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 虚拟环境
+venv/
+.venv/
+
+# IDE 配置
+.idea/
+.vscode/
+
+# 日志
+*.log
