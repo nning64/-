@@ -1,0 +1,35 @@
+# 03simulator 顶层 .gitignore
+# ──────────────────────────────────────────────
+# 顶层规则：合并自 远程 A 的 .gitignore + 学生 C 本地独有
+# 与 wind/.gitignore 各司其职：顶层管工程根目录的零散项，
+#                          wind/.gitignore 管 wind/ 子树内的细节。
+# ──────────────────────────────────────────────
+
+# ─── A 模块（远程已有）───
+# 数据库
+grid.db
+grid.db-shm
+grid.db-wal
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 虚拟环境
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# 日志
+*.log
+
+# ─── C 模块（本地独有，wind/ 镜像之外的内容不入库）───
+# 工程顶层零散工具和文件
+JCom.exe
+NetAssist.exe
+*.lnk
+scada/
+大作业备忘录.docx
