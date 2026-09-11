@@ -69,16 +69,17 @@ class SerialReceiverThread(QThread):
         last_grid_time = 0
         last_raw_ts = 0
         # 单片机复位检测：当前 PUSH ts 比上次小超过 RESET_GAP_MS（10s）视为
-        # HAL_GetTick 回退（单片机掉电/复位后 SysTick 从 0 重新累加），
-        # session_offset_ms 累加偏移，让 timestamp 严格单调递增。
-        # 同时启动时从 DB max(timestamp) 反推一次初始 offset，避免 wind_gui
-        # 重启后新 session 与 DB 已有数据冲突。
+        # 时钟源回退（掉电/复位后从 0 重新累加），session_offset_ms 累加偏移，
+        # 让 timestamp 严格单调递增。
+        #
+        # v0.4 起 ts 语义变更：PUSH 帧 ts = 单片机 sim_time × 1000，而 sim_time
+        # 在 A 在线时被 A 的 HEART 覆盖为 A 的权威仿真时刻。也就是说 ts 已经是
+        # "A 的绝对时间轴"，不再需要启动时用 DB max 反推 offset —— 那两个时间轴
+        # 本来就同源，叠加偏移反而会把对齐好的数据整体顶高（曾出现 A 端 77s、
+        # GUI 显示 99000+s 的错位，根因就是这里叠加了旧格式遗留的 DB max）。
+        # 所以：启动 offset 恒为 0，仅在运行期检测到 ts 回退时才累加。
         RESET_GAP_MS = 10000
-        try:
-            init_max_s = db.max_history_timestamp()
-            session_offset_ms = (int(init_max_s) * 1000 + RESET_GAP_MS) if init_max_s is not None else 0
-        except Exception:
-            session_offset_ms = 0
+        session_offset_ms = 0
         while self.running:
             # 1) 把排队的配置命令发出去（本线程是串口唯一写者）
             try:
