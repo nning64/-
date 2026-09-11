@@ -1370,7 +1370,12 @@ static void SendTelemetryToGUI(WindState_t *state) {
         return;
     }
     cJSON_AddStringToObject(root, "code", "PUSH");
-    cJSON_AddNumberToObject(root, "ts", (double)HAL_GetTick());
+    /* GUI timestamp now matches A's sim_time (interface.md 4.2 + v0.4 §4.2):
+     * - A 在线时被 A HEART 覆盖（rule 3）
+     * - A 离线时按 HAL_GetTick wallclock 推进
+     * 这样 A 日志（Unix ms）、C HEART（sim_time）、GUI 数据库（秒）
+     * 三方时间轴在仿真层面对齐；A 暂停仿真时 GUI 曲线自然静止。 */
+    cJSON_AddNumberToObject(root, "ts", (double)sim_time * 1000.0);
     cJSON_AddStringToObject(root, "src", "WT_CTRL");
     cJSON_AddItemToObject(root, "data", data);
     cJSON_AddItemToObject(data, "points", pts);

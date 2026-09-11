@@ -1143,11 +1143,17 @@ class MainWindow(QDialog, Ui_Dialog):
             self.label_8.setText("✅ 运行中" if run_status else "🔴 停机")
             self.label_8.setStyleSheet("color: green;" if run_status else "color: gray;")
 
-            # 仿真时刻
+            # 仿真时刻 + 数据时刻（label_27 = DB 最新 timestamp = sim_time，
+            # 不再用 wallclock —— 验收 D43/44 项要求"数据时刻"而非"刷新时刻"）。
+            # 自 v0.4 起 timestamp 来源 = 单片机 sim_time（A 在线时被 A HEART 覆盖），
+            # 与 A 端日志在仿真层面对齐；A 暂停时 GUI 曲线自然静止。
             cur.execute("SELECT timestamp FROM history_control ORDER BY id DESC LIMIT 1")
             row = cur.fetchone()
             sim_time = row[0] if row else 0
             self.label_10.setText(f"{sim_time:.0f} s")
+            # label_26 在 .ui 里是 "最后更新"，运行时改成 "数据时刻" 配合新语义
+            self.label_26.setText("数据时刻")
+            self.label_27.setText(f"T+{sim_time:.0f}s")
 
             # 串口连接状态（左 label_20）：串口线程是否存活。若线程已退出
             # （未找到/打开失败/接收错误断开），置为断开，避免残留"已连接"。
@@ -1160,9 +1166,8 @@ class MainWindow(QDialog, Ui_Dialog):
             # 固件状态行（[INFO]/[WARN]/[ERROR]）直接写到这里，这样"与服务器
             # 链路断开，正在重连并重新注册"等详情能保留、不被每秒刷新冲掉。
 
-            # 数据包计数和最后更新
+            # 数据包计数（label_27 已在上方"仿真时刻"块设为"数据时刻 T+Ns"）
             self.label_25.setText(str(self.packet_count))
-            self.label_27.setText(datetime.now().strftime("%H:%M:%S"))
 
             #  更新曲线（增量 append：每拍只取 DB 最新一行，按时间戳去重追加到缓存）
             cur.execute(
