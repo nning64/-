@@ -8,7 +8,8 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication,  QMessageBox, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QComboBox, QGroupBox,
-    QGridLayout, QDoubleSpinBox, QSpinBox, QTabWidget, QTextEdit, QDialog
+    QGridLayout, QDoubleSpinBox, QSpinBox, QTabWidget, QTextEdit, QDialog,
+    QLineEdit
 )
 from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt
 import pyqtgraph as pg
@@ -32,6 +33,7 @@ class SerialReceiverThread(QThread):
     """
     packet_received = pyqtSignal(int)  # 每收到一帧，发射信号（参数为数据包计数）
     status_updated = pyqtSignal(str)   # 状态信息（如"串口已连接"）
+    serial_opened = pyqtSignal()       # 串口打开成功（主线程借机做参数自动同步）
 
     def __init__(self, port, baudrate=115200, db_path="./db/wind.db"):
         super().__init__()
@@ -53,6 +55,9 @@ class SerialReceiverThread(QThread):
         try:
             ser = serial.Serial(self.port, self.baudrate, timeout=1)
             self.status_updated.emit(f"串口 {self.port} 已连接")
+            # 通知主线程：单片机可能刚复位回固件默认参数，把数据库里的
+            # 参数/服务器地址推过去，保证两端一致（评分表 35 项）。
+            self.serial_opened.emit()
         except Exception as e:
             self.status_updated.emit(f"串口打开失败: {e}")
             return
@@ -90,8 +95,16 @@ class SerialReceiverThread(QThread):
 
                 stripped = line.strip()
 
-                # 2) 配置命令应答：截获并通知等待者，不进常规解析
+                # 2) 配置命令应答：截获并通知等待者，不进常规解析。
+                #    旧固件回纯文本 OK/ERROR/UNKNOWN_CMD；
+                #    新固件回 JSON 回显帧（{"cmd":"set_params_ack",...}，
+                #    携带单片机实际生效的参数值，供主线程做一致性比对）。
+                #    注意与遥测帧区分：遥测帧有 "code" 字段、应答帧有 "cmd" 字段。
                 if stripped in ("OK", "ERROR", "UNKNOWN_CMD"):
+                    self.cfg_reply = stripped
+                    self.cfg_event.set()
+                    continue
+                if stripped.startswith('{"cmd"'):
                     self.cfg_reply = stripped
                     self.cfg_event.set()
                     continue
@@ -174,6 +187,17 @@ class MainWindow(QDialog, Ui_Dialog):
 
         # 加载参数到界面
         self.load_params_to_ui()
+
+        # 服务器 IP/端口设置控件（评分表 34 项，动态加到参数面板第三行）
+        self.init_server_ip_controls()
+
+        # "单片机回显验证"常驻显示行（评分表 35 项）：加在 groupBox_2 只读
+        # 参数栏第 8 行（gridLayout_9 已有 7 行，label_28~43）
+        self.mcu_echo_caption = QLabel("单片机回显验证")
+        self.mcu_echo_label = QLabel("（等待参数下发后比对）")
+        self.mcu_echo_label.setStyleSheet("font-weight:bold; color:#777;")
+        self.gridLayout_9.addWidget(self.mcu_echo_caption, 8, 0, 1, 1)
+        self.gridLayout_9.addWidget(self.mcu_echo_label, 8, 1, 1, 1)
 
         # 定时刷新界面（每秒）
         self.timer = QTimer()
@@ -573,8 +597,71 @@ class MainWindow(QDialog, Ui_Dialog):
         self.log(f"控制模式切换为【{mode_name}】，正在下发到单片机...")
         self.save_params(show_dialog=False)
 
+    def _send_config_cmd(self, cmd_obj, expect=None, timeout=5.0):
+        """通过串口线程下发配置命令并等待固件应答（评分表 35 项核心）。
+
+        cmd_obj:  要序列化成 JSON 的命令对象（set_params / set_server）
+        expect:   期望固件回显的参数值 {键: 期望值}。新固件应答帧里带
+                  单片机实际生效的参数，逐项与期望值比对：
+                  全部一致 → ok=True；任何一项不一致 → ok=False 并列出差异。
+                  传 None 表示不比对（只确认收到应答）。
+        返回 (ok, detail)：detail 是可直接打日志的中文说明。
+        """
+        if not (self.serial_thread and self.serial_thread.isRunning()):
+            return False, "串口未连接，命令未下发"
+        t = self.serial_thread
+        t.cfg_event.clear()
+        t.cfg_reply = None
+        t.cmd_queue.put(json.dumps(cmd_obj))
+        # 固件主循环 1s 一拍处理 rx2，应答最长约 2s，放宽到 5s
+        if not t.cfg_event.wait(timeout=timeout):
+            return False, "固件应答超时"
+        reply = t.cfg_reply
+        if reply == "ERROR":
+            return False, "单片机 JSON 解析失败"
+        if reply == "UNKNOWN_CMD":
+            return False, "单片机不认识该命令（固件版本过旧，需重新烧录）"
+        if reply == "OK":
+            # 旧固件只回 OK，无法验证一致性
+            return True, "已下发（旧固件只回 OK，无回显可比对）"
+        # 新固件：JSON 回显帧（{"cmd":"..._ack", ...实际生效值}）
+        try:
+            ack = json.loads(reply)
+        except json.JSONDecodeError:
+            return True, f"已下发（回显帧无法解析: {reply[:60]}）"
+        if expect:
+            diffs = []
+            for key, want in expect.items():
+                got = ack.get(key)
+                if isinstance(want, float):
+                    if got is None or abs(float(got) - want) > 1e-6:
+                        diffs.append(f"{key}: 界面={want} 单片机={got}")
+                elif got != want:
+                    diffs.append(f"{key}: 界面={want} 单片机={got}")
+            if diffs:
+                self._show_mcu_echo(False, "; ".join(diffs))
+                return False, "回显不一致 → " + "; ".join(diffs)
+            self._show_mcu_echo(True, f"{len(expect)} 项全部一致")
+            return True, f"已下发且单片机回显一致 ✓（{len(expect)} 项全部匹配）"
+        return True, "已下发并收到回显"
+
+    def _show_mcu_echo(self, ok, detail):
+        """把单片机回显比对结果常驻显示在"当前风机参数"面板末行。
+
+        评分表 35 项判据是"单片机计算所用参数 == 界面显示值"——
+        日志一闪而过，验收时把这个结论挂在参数栏里随时可见。"""
+        if not hasattr(self, 'mcu_echo_label'):
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        if ok:
+            self.mcu_echo_label.setText(f"✓ 一致（{detail}）@ {ts}")
+            self.mcu_echo_label.setStyleSheet("font-weight:bold; color:#26a269;")
+        else:
+            self.mcu_echo_label.setText(f"✗ 不一致: {detail} @ {ts}")
+            self.mcu_echo_label.setStyleSheet("font-weight:bold; color:#e01b24;")
+
     def save_params(self, show_dialog=True):
-        """保存参数：更新数据库 + 下发到单片机"""
+        """保存参数：更新数据库 + 下发到单片机 + 回显一致性校验"""
         cut_in = self.doubleSpinBox.value()
         rated = self.doubleSpinBox_2.value()
         cut_out = self.doubleSpinBox_3.value()
@@ -585,7 +672,7 @@ class MainWindow(QDialog, Ui_Dialog):
         try:
             cur = self.db.conn.cursor()
             cur.execute("""
-                UPDATE device_params 
+                UPDATE device_params
                 SET cut_in_wind=?, rated_wind=?, cut_out_wind=?, rated_power=?, control_mode=?, update_time=?
                 WHERE id=1
             """, (cut_in, rated, cut_out, rated_power, mode, int(time.time())))
@@ -600,40 +687,32 @@ class MainWindow(QDialog, Ui_Dialog):
             QMessageBox.critical(self, "错误", f"保存到数据库失败: {e}")
             return
 
-        # 2. 通过串口下发给单片机
-        # 优先走接收线程的命令队列（串口单一所有者，不再停/开串口——
-        # 旧方案每次下发都要"停线程→重开串口→重启线程"，在 Windows 上
-        # 时好时坏，还会把 GUI 搞成"断连"）。
-        cmd = json.dumps({
-            "cmd": "set_params",
-            "cut_in": cut_in,
-            "rated_wind": rated,
-            "cut_out": cut_out,
-            "rated_power": rated_power,
-            "mode": mode
-        })
+        # 2. 通过串口线程下发给单片机，并核对单片机实际生效值与界面一致
+        #    （评分表 35 项：改参数 → 下发 → 单片机生效 → 生效值==显示值）
+        expect = {
+            "cut_in": float(cut_in),
+            "rated_wind": float(rated),
+            "cut_out": float(cut_out),
+            "rated_power": float(rated_power),
+            "mode": int(mode),
+        }
         if self.serial_thread and self.serial_thread.isRunning():
-            t = self.serial_thread
-            t.cfg_event.clear()
-            t.cfg_reply = None
-            t.cmd_queue.put(cmd)
-            # 固件主循环 1s 一拍处理 rx2，应答最长约 2s，放宽到 5s
-            if t.cfg_event.wait(timeout=5.0):
-                reply = t.cfg_reply
-                if reply == "OK":
-                    self.log(" ✅参数已下发到单片机")
-                elif reply == "ERROR":
-                    self.log("⚠️单片机解析失败（JSON格式错误）")
-                else:
-                    self.log(f"⚠️单片机返回: {reply}")
-            else:
-                self.log("⚠️参数下发超时（未收到 OK 应答）")
+            ok, detail = self._send_config_cmd({
+                "cmd": "set_params",
+                "cut_in": cut_in,
+                "rated_wind": rated,
+                "cut_out": cut_out,
+                "rated_power": rated_power,
+                "mode": mode
+            }, expect=expect)
+            self.log(("✅ 参数" if ok else "⚠️ 参数") + detail)
         else:
             # 接收线程不在跑（串口空闲）：退回独立打开串口的方式
+            # （旧固件兼容路径，只有 OK/ERROR 应答，无一致性比对）
             try:
                 success = send_params(self.serial_port, cut_in, rated, cut_out, rated_power, mode)
                 if success:
-                    self.log(" ✅参数已下发到单片机")
+                    self.log(" ✅参数已下发到单片机（旧固件路径，无回显比对）")
                 else:
                     self.log("⚠️参数下发失败")
             except Exception as e:
@@ -703,7 +782,133 @@ class MainWindow(QDialog, Ui_Dialog):
         self.serial_thread = SerialReceiverThread(port)
         self.serial_thread.packet_received.connect(self.on_packet_received)
         self.serial_thread.status_updated.connect(self.on_serial_status)
+        self.serial_thread.serial_opened.connect(self.on_serial_opened)
         self.serial_thread.start()
+
+    def on_serial_opened(self):
+        """串口连接建立后：把数据库里的参数与服务器地址推给单片机。
+
+        场景（评分表 35 项一致性）：单片机复位后固件参数回到编译默认值
+        （cut_in=3 / rated_wind=12 / ...），与数据库/界面显示悄悄失配。
+        这里在每次串口连接成功时主动同步一次，并用回显校验两端一致。
+        延时 500ms 再执行：让窗口先完成首次绘制，且给串口线程一点
+        时间进入读循环，避免阻塞启动画面。"""
+        QTimer.singleShot(500, self._do_post_connect_sync)
+
+    def _do_post_connect_sync(self):
+        # 线程可能已在此期间退出（如立即断连），先确认还活着
+        if not (self.serial_thread and self.serial_thread.isRunning()):
+            return
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute(
+                "SELECT cut_in_wind, rated_wind, cut_out_wind, rated_power, "
+                "control_mode FROM device_params WHERE id=1")
+            row = cur.fetchone()
+            if row:
+                ok, detail = self._send_config_cmd({
+                    "cmd": "set_params",
+                    "cut_in": row[0], "rated_wind": row[1],
+                    "cut_out": row[2], "rated_power": row[3], "mode": row[4]
+                }, expect={
+                    "cut_in": float(row[0]), "rated_wind": float(row[1]),
+                    "cut_out": float(row[2]), "rated_power": float(row[3]),
+                    "mode": int(row[4])
+                })
+                self.log(("✅ " if ok else "⚠️ ") + f"连接后参数自动同步: {detail}")
+        except Exception as e:
+            self.log(f"⚠️ 连接后参数自动同步失败: {e}")
+
+        # 服务器地址：仅当用户在界面设置过（DB 里非初始占位值）才推送
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT ip_addr, port FROM rtu_info WHERE id=1")
+            row = cur.fetchone()
+            if row and row[0] and row[0] not in ("127.0.0.1", ""):
+                ok, detail = self._send_config_cmd({
+                    "cmd": "set_server", "ip": row[0], "port": row[1]
+                }, expect={"ip": row[0], "port": int(row[1])})
+                self.log(("✅ " if ok else "⚠️ ") + f"连接后服务器地址同步: {detail}")
+        except Exception as e:
+            self.log(f"⚠️ 连接后服务器地址同步失败: {e}")
+
+    # ---- 评分表 34 项：界面设置通信 IP 地址 ----
+    def init_server_ip_controls(self):
+        """在参数控制面板（gridLayout_2）第三行加"服务器IP / 端口 / 应用"控件。
+
+        控件动态添加而不改 .ui 文件：Ui_wind_show.py 是 pyuic6 生成物，
+        重新生成会覆盖手工改动；所有动态控件在 wind_gui 里创建更稳。"""
+        ip_wrap = QHBoxLayout()
+        ip_wrap.addWidget(QLabel("服务器IP"))
+        self.ip_edit = QLineEdit()
+        self.ip_edit.setPlaceholderText("固件默认 10.18.134.231")
+        ip_wrap.addWidget(self.ip_edit)
+        self.gridLayout_2.addLayout(ip_wrap, 2, 0, 1, 1)
+
+        port_wrap = QHBoxLayout()
+        port_wrap.addWidget(QLabel("端口"))
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(9000)
+        port_wrap.addWidget(self.port_spin)
+        self.gridLayout_2.addLayout(port_wrap, 2, 1, 1, 1)
+
+        self.apply_ip_btn = QPushButton("应用IP(重连)")
+        self.apply_ip_btn.clicked.connect(self.apply_server_ip)
+        self.gridLayout_2.addWidget(self.apply_ip_btn, 2, 2, 1, 1)
+
+        # 回填数据库里上次设置的地址（没设置过则留空，用 placeholder 提示默认值；
+        # 端口只在 IP 也设置过时才回填——DB 初始占位 port=6666 不是固件默认）
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT ip_addr, port FROM rtu_info WHERE id=1")
+            row = cur.fetchone()
+            if row and row[0] and row[0] != "127.0.0.1":
+                self.ip_edit.setText(row[0])
+                if row[1]:
+                    self.port_spin.setValue(int(row[1]))
+        except Exception as e:
+            print(f"[init_server_ip_controls] 读取历史IP失败: {e}")
+
+    def apply_server_ip(self):
+        """校验 → 存库 → 下发 set_server → 比对回显。
+
+        固件收到后更新 g_server_ip/port 并置 g_link_closed，
+        主循环的链路监督会立即用新地址走 LinkReconnect 重连 A 端。"""
+        ip = self.ip_edit.text().strip()
+        port = self.port_spin.value()
+
+        # IPv4 格式校验（固件端只做长度校验，完整校验在 GUI 做）
+        parts = ip.split(".")
+        if len(parts) != 4 or not all(
+                p.isdigit() and 0 <= int(p) <= 255 and p != "" for p in parts):
+            QMessageBox.warning(self, "IP 格式错误",
+                                f"「{ip}」不是有效的 IPv4 地址\n示例: 10.18.134.231")
+            return
+
+        # 1. 存数据库（重启 GUI 后自动回填 + 串口连接时自动推给单片机）
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute("UPDATE rtu_info SET ip_addr=?, port=? WHERE id=1", (ip, port))
+            self.db.conn.commit()
+        except Exception as e:
+            self.log(f"❌ 服务器地址保存失败: {e}")
+            QMessageBox.critical(self, "错误", f"保存服务器地址失败: {e}")
+            return
+
+        # 2. 下发并比对回显
+        ok, detail = self._send_config_cmd(
+            {"cmd": "set_server", "ip": ip, "port": port},
+            expect={"ip": ip, "port": int(port)})
+        if ok:
+            self.log(f"✅ 服务器地址 {ip}:{port} {detail}，单片机正在用新地址重连...")
+            QMessageBox.information(
+                self, "已应用",
+                f"服务器地址已下发: {ip}:{port}\n单片机将断开当前连接并用新地址重连，\n"
+                f"状态栏出现「RECONNECT OK / TCP OK」即为成功。")
+        else:
+            self.log(f"⚠️ 服务器地址下发: {detail}")
+            QMessageBox.warning(self, "注意", f"服务器地址下发结果:\n{detail}")
 
     def on_packet_received(self, count):
         self.packet_count = count

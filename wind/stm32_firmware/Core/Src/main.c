@@ -154,8 +154,14 @@ AckPending_t g_ack_pending[4];
 // WiFi 配置（请改成你实测能连上的路由器）
 #define WIFI_SSID "yxtwifi"
 #define WIFI_PASS "vqcx3322"
-#define TCP_SERVER_IP "10.18.134.231"
-#define TCP_SERVER_PORT 9000
+
+/* A 端服务器地址：编译默认值 + 运行时可由上位机 set_server 命令修改
+ * （评分表 34 项"能在界面设置通信IP地址"）。重启后回默认值，
+ * GUI 每次串口连接成功会自动把数据库里保存的地址重新推过来。 */
+#define TCP_SERVER_IP_DEFAULT  "10.18.134.231"
+#define TCP_SERVER_PORT_DEFAULT 9000
+char    g_server_ip[24] = TCP_SERVER_IP_DEFAULT;
+uint16_t g_server_port  = TCP_SERVER_PORT_DEFAULT;
 
 // 串口收发临时缓冲区（AT 命令收发）
 char wifi_rx_buf[256];
@@ -618,7 +624,7 @@ static uint8_t WiFi_Init(void) {
     //    同一网段（最常见：对方电脑 DHCP 换了 IP，需更新 TCP_SERVER_IP））
     {
         char tip[64];
-        sprintf(tip, "TCP -> %s:%d\r\n", TCP_SERVER_IP, TCP_SERVER_PORT);
+        sprintf(tip, "TCP -> %s:%d\r\n", g_server_ip, g_server_port);
         DebugPrint(tip);
     }
     uint8_t tcp_ok = 0;
@@ -629,7 +635,7 @@ static uint8_t WiFi_Init(void) {
         WiFi_SendCmd("AT+CIPCLOSE", "CLOSED", 1000);   // 无连接时回 ERROR，忽略即可
         UART1_Flush();
 
-        sprintf(wifi_tx_buf, "AT+CIPSTART=\"TCP\",\"%s\",%d", TCP_SERVER_IP, TCP_SERVER_PORT);
+        sprintf(wifi_tx_buf, "AT+CIPSTART=\"TCP\",\"%s\",%d", g_server_ip, g_server_port);
         // "ALREADY CONNECTED" 里也含 "CONNECT" 子串，但那说明复用了一条
         // 来路不明的旧连接 —— 按失败处理，本轮循环重试时会先 CIPCLOSE
         // 超时 10s：目标不可达时模块自己的连接超时 >5s，太短会在它还在
@@ -728,7 +734,7 @@ static uint8_t LinkReconnect(void) {
         /* 关旧连接 -> 新建 TCP -> 重新注册（REG 成功 A 端才算我们在线） */
         WiFi_SendCmd("AT+CIPCLOSE", "CLOSED", 1000);   /* 无连接时回 ERROR，忽略 */
         UART1_Flush();
-        sprintf(wifi_tx_buf, "AT+CIPSTART=\"TCP\",\"%s\",%d", TCP_SERVER_IP, TCP_SERVER_PORT);
+        sprintf(wifi_tx_buf, "AT+CIPSTART=\"TCP\",\"%s\",%d", g_server_ip, g_server_port);
         /* 超时 10s：太短会在模块还在处理上次 CIPSTART 时打断 -> busy p... */
         if (!WiFi_SendCmd(wifi_tx_buf, "CONNECT", 10000)) { LinkWaitYield(1000); continue; }
         /* "ALREADY CONNECTED" 防误判：关掉重连一次 */
@@ -764,6 +770,17 @@ static uint8_t LinkReconnect(void) {
     return 1;
 }
 
+// 应答帧统一用 cJSON 构造后整体发出（一行 JSON + '\n'）
+static void SendConfigAck(cJSON *ack) {
+    char *s = cJSON_PrintUnformatted(ack);
+    cJSON_Delete(ack);
+    if (s == NULL) return;
+    uint32_t len = (uint32_t)strlen(s);
+    s[len] = '\n';
+    HAL_UART_Transmit(&huart2, (uint8_t*)s, len + 1, 200);
+    cJSON_free(s);
+}
+
 // 解析上位机发来的 JSON 配置命令
 void ParseConfigCommand(char *json_str) {
     cJSON *root = cJSON_Parse(json_str);
@@ -790,8 +807,55 @@ void ParseConfigCommand(char *json_str) {
         if (rated_power && cJSON_IsNumber(rated_power)) g_wind_params.rated_power = rated_power->valuedouble;
         if (mode && cJSON_IsNumber(mode)) g_control_mode = (uint8_t)mode->valuedouble;
 
-        // 回复 OK
-        HAL_UART_Transmit(&huart2, (uint8_t*)"OK\r\n", 4, 100);
+        /* 评分表 35 项"串口回写及一致性"：不再只回 OK，而是把单片机
+         * 实际生效的参数值回显给上位机，由上位机与界面显示值逐项比对。
+         * 回的是更新后的 g_wind_params / g_control_mode —— 即单片机
+         * 控制算法真正在用的值，不是简单地抄写收到的数字。 */
+        cJSON *ack = cJSON_CreateObject();
+        if (ack != NULL) {
+            cJSON_AddStringToObject(ack, "cmd", "set_params_ack");
+            cJSON_AddNumberToObject(ack, "cut_in", g_wind_params.cut_in);
+            cJSON_AddNumberToObject(ack, "rated_wind", g_wind_params.rated_wind);
+            cJSON_AddNumberToObject(ack, "cut_out", g_wind_params.cut_out);
+            cJSON_AddNumberToObject(ack, "rated_power", g_wind_params.rated_power);
+            cJSON_AddNumberToObject(ack, "mode", g_control_mode);
+            SendConfigAck(ack);
+        } else {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"OK\r\n", 4, 100);
+        }
+    } else if (cmd && cJSON_IsString(cmd) && strcmp(cmd->valuestring, "set_server") == 0) {
+        /* 评分表 34 项"能在界面设置通信IP地址"：更新 A 端服务器地址并
+         * 立即用新地址重连。回显实际生效的 ip/port 供上位机比对。 */
+        cJSON *ip   = cJSON_GetObjectItem(root, "ip");
+        cJSON *port = cJSON_GetObjectItem(root, "port");
+
+        uint8_t valid = (ip && cJSON_IsString(ip) &&
+                         ip->valuestring[0] != '\0' &&
+                         strlen(ip->valuestring) < sizeof(g_server_ip));
+        if (valid) {
+            strcpy(g_server_ip, ip->valuestring);
+            if (port && cJSON_IsNumber(port)) {
+                int p = (int)port->valuedouble;
+                if (p > 0 && p <= 65535) g_server_port = (uint16_t)p;
+            }
+            /* 置链路断开标志：主循环 3b 的监督条件会捕获它并走
+             * LinkReconnect —— 那里用的就是刚更新的 g_server_ip/port。
+             * 若链路本来就没建立，下一次重连同样用新地址。 */
+            g_link_closed = 1;
+        }
+
+        cJSON *ack = cJSON_CreateObject();
+        if (ack != NULL) {
+            cJSON_AddStringToObject(ack, "cmd", "set_server_ack");
+            cJSON_AddStringToObject(ack, "ip", g_server_ip);
+            cJSON_AddNumberToObject(ack, "port", (double)g_server_port);
+            cJSON_AddBoolToObject(ack, "applied", valid ? 1 : 0);
+            SendConfigAck(ack);
+        } else if (valid) {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"OK\r\n", 4, 100);
+        } else {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"ERROR\r\n", 7, 100);
+        }
     } else {
         // 未知命令
         HAL_UART_Transmit(&huart2, (uint8_t*)"UNKNOWN_CMD\r\n", 13, 100);

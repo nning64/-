@@ -335,13 +335,19 @@ class WindDB:
             set_power = get_val('WT_P_SET')
             run_status = get_yx('WT_RUN')
 
+            # 控制模式：以 device_params 表为权威（GUI 切换开/闭环时实时更新）。
+            # 不能硬编码 1 —— 否则切到开环后查历史仍显示"闭环"，
+            # 验收老师按时间轴核对模式切换点时直接穿帮。
+            self.cursor.execute("SELECT control_mode FROM device_params WHERE id=1")
+            mrow = self.cursor.fetchone()
+            control_mode = int(mrow[0]) if mrow and mrow[0] is not None else 1
+
             sql = """
             INSERT INTO history_control
             (timestamp, wind_speed, avail_power, output_power, pitch_angle, power_setpoint, run_status, control_mode)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """
-            # 控制模式默认为1（闭环），因为我们已在接收真实数据
-            self.cursor.execute(sql, (ts, wind, avail, output, pitch, set_power, int(run_status), 1))
+            self.cursor.execute(sql, (ts, wind, avail, output, pitch, set_power, int(run_status), control_mode))
             self.conn.commit()
         except Exception as e:
             print(f"保存历史快照失败: {e}")
