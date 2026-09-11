@@ -48,19 +48,30 @@ class SerialReceiverThread(QThread):
         self.cfg_reply = None                # "OK" / "ERROR" / "UNKNOWN_CMD"
 
     def run(self):
-        # 连接数据库
-        db = WindDB(self.db_path)
-
-        # 打开串口
+        # 先打开串口：端口不存在 / 被别的程序占用时立刻失败返回。
+        # 放在建数据库之前是有意的——拔线重连场景下本线程每 2 s 会被
+        # 重试一次，端口打不开时不必白建一次 SQLite 连接。
         try:
             ser = serial.Serial(self.port, self.baudrate, timeout=1)
-            self.status_updated.emit(f"串口 {self.port} 已连接")
-            # 通知主线程：单片机可能刚复位回固件默认参数，把数据库里的
-            # 参数/服务器地址推过去，保证两端一致（评分表 35 项）。
-            self.serial_opened.emit()
         except Exception as e:
             self.status_updated.emit(f"串口打开失败: {e}")
             return
+
+        # 连接数据库
+        try:
+            db = WindDB(self.db_path)
+        except Exception as e:
+            self.status_updated.emit(f"数据库打开失败: {e}")
+            try:
+                ser.close()
+            except Exception:
+                pass
+            return
+
+        self.status_updated.emit(f"串口 {self.port} 已连接")
+        # 通知主线程：单片机可能刚复位回固件默认参数，把数据库里的
+        # 参数/服务器地址推过去，保证两端一致（评分表 35 项）。
+        self.serial_opened.emit()
 
         def on_status(level, message):
             # 固件文本状态行 -> 界面状态栏（带级别前缀方便配色）
@@ -155,7 +166,10 @@ class SerialReceiverThread(QThread):
 
     def stop(self):
         self.running = False
-        self.wait()
+        # 读循环 timeout=1s，正常 1 秒内自行退出；给 2s 上限是为了在
+        # 端口句柄已随拔线失效、readline 卡住的极端情况下也不冻住主线程
+        # （stop 由 GUI 线程调用）。
+        self.wait(2000)
 
 
 #  主窗口
@@ -240,6 +254,18 @@ class MainWindow(QDialog, Ui_Dialog):
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh_ui)
         self.timer.start(1000)
+
+        # 串口断线自动重连（拔插 USB-TTL / 驱动重枚举 / COM 号变化）：
+        # auto_connect_serial 只在启动时跑一次，而 SerialReceiverThread 在
+        # 拔线后收到异常就退出线程且再无任何人工入口 —— 旧版本必须重启 GUI
+        # 才能恢复。这里每 2 s 自检一次：线程不在跑就重扫端口重连，线程在跑
+        # 但端口已从系统里消失（部分驱动拔线后读循环只是静默空转、不报错）
+        # 也强制重连。
+        self._serial_retry_timer = QTimer(self)
+        self._serial_retry_timer.setInterval(2000)
+        self._serial_retry_timer.timeout.connect(self._on_serial_retry_tick)
+        self._serial_retry_timer.start()
+        self._serial_retry_count = 0     # 连续失败次数（日志节流用）
 
         # 尝试自动连接串口
         self.auto_connect_serial()
@@ -702,7 +728,8 @@ class MainWindow(QDialog, Ui_Dialog):
     def _send_config_cmd(self, cmd_obj, expect=None, timeout=5.0, return_ack=False):
         """通过串口线程下发配置命令并等待固件应答（评分表 35 项核心）。
 
-        cmd_obj:  要序列化成 JSON 的命令对象（set_params / set_server / get_server）
+        cmd_obj:  要序列化成 JSON 的命令对象（set_params / get_params /
+                  set_server / get_server）
         expect:   期望固件回显的参数值 {键: 期望值}。新固件应答帧里带
                   单片机实际生效的参数，逐项与期望值比对：
                   全部一致 → ok=True；任何一项不一致 → ok=False 并列出差异。
@@ -993,27 +1020,101 @@ class MainWindow(QDialog, Ui_Dialog):
             print(f"refresh_current_params 错误: {e}")
 
     # 串口连接
-    def auto_connect_serial(self):
-        """自动查找并连接串口"""
-        ports = serial.tools.list_ports.comports()
-        target_port = None
-        for p in ports:
-            desc = p.description.lower()
+    @staticmethod
+    def _find_serial_port():
+        """扫描系统串口，返回第一个疑似 USB-TTL 的端口名（没有则 None）。
+
+        每次都重新扫描而不记住旧端口号：拔插后 CH340/CP210x 有可能
+        重新枚举成另一个 COMx，认死旧端口会永远连不上。"""
+        for p in serial.tools.list_ports.comports():
+            desc = (p.description or "").lower()
             if any(key in desc for key in ["ch340", "cp210", "stlink", "usb serial"]):
-                target_port = p.device
-                break
-        if target_port is None:
-            self.label_20.setText("🔴 找不到串口")
+                return p.device
+        return None
+
+    def _serial_alive(self):
+        """接收线程是否还在跑（即串口是否处于已打开状态）。"""
+        return bool(self.serial_thread and self.serial_thread.isRunning())
+
+    def _port_in_system(self, port):
+        """端口是否仍存在于系统串口列表里（判断 USB 有没有被拔掉）。"""
+        if not port:
+            return False
+        try:
+            return port in [p.device for p in serial.tools.list_ports.comports()]
+        except Exception:
+            return True     # 枚举失败时不误判成"已拔线"
+
+    def _set_serial_state(self, text, color):
+        """更新"串口"行的显示（与 label_20 同步，给重连按钮一个就近反馈）。"""
+        if hasattr(self, 'serial_state_label'):
+            self.serial_state_label.setText(text)
+            self.serial_state_label.setStyleSheet(
+                f"font-weight:bold; color:{color};")
+
+    def auto_connect_serial(self):
+        """启动时自动查找并连接串口（找不到交给 2s 重试定时器继续试）"""
+        self._on_serial_retry_tick()
+
+    def _on_serial_retry_tick(self):
+        """每 2 s 自检一次串口，需要时自动重连。
+
+        覆盖三种故障：
+          1) 启动时 USB-TTL 没插好 / 端口还没枚举完（打开失败 → 下轮再试）
+          2) 运行中拔线（读循环抛异常 → 线程已退出 → 重连）
+          3) 拔线后驱动不报错、读循环静默空转（线程还"活着"，但端口已从
+             系统串口列表里消失 → 判定拔线，停掉旧线程重连）
+        """
+        if self._serial_alive():
+            if self._port_in_system(self.serial_port):
+                self._serial_retry_count = 0     # 一切正常
+                return
+            # 线程在跑但端口没了 = 拔线且驱动没报错
+            self.log(f"⚠️ 串口 {self.serial_port} 已从系统消失（USB 被拔出），"
+                     f"正在释放句柄…")
+            try:
+                self.serial_thread.stop()
+            except Exception:
+                pass
+            self.serial_port = None
+            # 不在这里写状态行：本函数随后必然重扫端口并写出最终状态
+            # （连上了=绿，没扫到=红"未检测到 USB-TTL"），此处写会被立刻覆盖
+
+        self._serial_retry_count += 1
+        port = self._find_serial_port()
+        if port is None:
+            self.label_20.setText("🔴 未检测到串口，每 2 秒自动重试…")
             self.label_20.setStyleSheet("color: red;")
+            self._set_serial_state("（未检测到 USB-TTL）", "#e01b24")
+            # 首次 + 之后每 15 次（约 30 s）提示一次，避免日志刷屏
+            if self._serial_retry_count == 1 or self._serial_retry_count % 15 == 0:
+                self.log("⚠️ 未检测到串口（CH340 / CP210x / ST-Link），"
+                         "请确认 USB-TTL 已插好；上位机每 2 秒自动重试。")
             return
-        self.serial_port = target_port
-        self.start_serial_thread(target_port)
+
+        # 端口在 → 重建接收线程（旧句柄可能已随拔线失效）
+        if self._serial_retry_count > 1 or self.serial_port != port:
+            self.log(f"🔄 正在连接串口 {port} …")
+        self.start_serial_thread(port)
+
+    def reconnect_serial(self):
+        """手动重连（"重连串口"按钮）：先停旧线程，再立即重扫端口连一次。"""
+        if self._serial_alive():
+            try:
+                self.serial_thread.stop()
+            except Exception:
+                pass
+            self.serial_port = None
+        self._serial_retry_count = 0
+        self.log("🔄 手动重连串口…")
+        self._on_serial_retry_tick()
 
     def start_serial_thread(self, port):
         """启动串口接收线程"""
-        if self.serial_thread and self.serial_thread.isRunning():
+        if self._serial_alive():
             self.serial_thread.stop()
 
+        self.serial_port = port
         self.serial_thread = SerialReceiverThread(port)
         self.serial_thread.packet_received.connect(self.on_packet_received)
         self.serial_thread.status_updated.connect(self.on_serial_status)
@@ -1066,10 +1167,50 @@ class MainWindow(QDialog, Ui_Dialog):
                 self.log(f"⚠️ 查询固件服务器地址失败: {e}")
         return fw_ip, fw_port
 
+    def _query_fw_params(self, quiet=True):
+        """主动读回单片机**此刻**实际生效的参数（get_params 命令）。
+
+        为什么需要它：set_params_ack 只在"下发之后"才有回显，所以拔插串口 /
+        单片机复位后，上位机无从知道单片机里到底是哪一组参数——它可能已经
+        回到固件编译默认值（cut_in=3 / rated_wind=12 / …），而界面显示的是
+        数据库里的值。两端失配但界面上看不出来，这正是"拔了再插上数据可能
+        不一致"的成因。连上串口后先读一次，把单片机真实在用的一组值摆到
+        "单片机实际生效参数"区，再下发 set_params 把它纠正过来——失配与
+        纠偏的全过程在日志和展示区里都看得见（评分表 35 项证据链）。
+
+        旧固件没有 get_params 命令（会回 UNKNOWN_CMD）：静默降级返回 None，
+        不刷日志、不污染回显展示区。返回 {参数名: 值} 或 None。"""
+        try:
+            ok, _detail, ack = self._send_config_cmd(
+                {"cmd": "get_params"}, return_ack=True, timeout=2.0)
+        except Exception as e:
+            if not quiet:
+                self.log(f"⚠️ 读取单片机参数失败: {e}")
+            return None
+        if ok and isinstance(ack, dict) and self._ack_has_params(ack):
+            vals = {k: ack.get(k) for k, _cn, _u in self._MCU_ECHO_SPEC
+                    if k in ack}
+            txt = " / ".join(
+                f"{cn} {self._fmt_param_value(k, ack.get(k))}"
+                for k, cn, _u in self._MCU_ECHO_SPEC if k in ack)
+            self.log(f"📋 单片机当前实际参数: {txt}")
+            # 只把值渲染出来，不写结论行/验证记录（此处没有期望值可比对）
+            try:
+                self._render_mcu_params(ack, expect=None)
+            except Exception as e:
+                print(f"_render_mcu_params 错误: {e}")
+            return vals
+        return None
+
     def _do_post_connect_sync(self):
         # 线程可能已在此期间退出（如立即断连），先确认还活着
         if not (self.serial_thread and self.serial_thread.isRunning()):
             return
+
+        # 0) 先读：把单片机此刻的参数值摆到界面上（拔插/复位后它可能已回到
+        #    固件默认值，与界面显示值不一致）。先读后写，失配看得见。
+        self._query_fw_params()
+
         try:
             cur = self.db.conn.cursor()
             cur.execute(
@@ -1163,6 +1304,20 @@ class MainWindow(QDialog, Ui_Dialog):
         self.link_server_label.setStyleSheet("font-weight:bold; color:#777;")
         server_wrap.addWidget(self.link_server_label)
         self.gridLayout_2.addLayout(server_wrap, 3, 0, 1, 3)
+
+        # 串口状态 + 手动重连按钮（第 4 行）：
+        # 拔插 USB-TTL 后 2s 自动重连是兜底；这里给一个能立刻触发、看得见
+        # 结果的入口（验收时"拔线 → 重插 → 点重连 → 数据恢复"一步到位）。
+        serial_wrap = QHBoxLayout()
+        serial_wrap.addWidget(QLabel("串口"))
+        self.serial_state_label = QLabel("（未连接）")
+        self.serial_state_label.setStyleSheet("font-weight:bold; color:#777;")
+        serial_wrap.addWidget(self.serial_state_label)
+        serial_wrap.addStretch(1)
+        self.reconnect_btn = QPushButton("重连串口")
+        self.reconnect_btn.clicked.connect(self.reconnect_serial)
+        serial_wrap.addWidget(self.reconnect_btn)
+        self.gridLayout_2.addLayout(serial_wrap, 4, 0, 1, 3)
 
         # 初始文案：数据库设置过就显示该地址（是否真的在用要等 TCP -> 行确认）
         try:
@@ -1269,9 +1424,12 @@ class MainWindow(QDialog, Ui_Dialog):
             if "已连接" in msg:
                 self.label_20.setText(f"🟢 {msg}")
                 self.label_20.setStyleSheet("color: green;")
+                self._set_serial_state(f"{self.serial_port or ''} 已连接", "#26a269")
             else:
                 self.label_20.setText(f"🔴 {msg}")
                 self.label_20.setStyleSheet("color: red;")
+                # 断开/打开失败都交给 2s 重连定时器，这里只做展示
+                self._set_serial_state("（断开，自动重连中…）", "#e01b24")
 
     #  界面刷新
     def refresh_ui(self):
@@ -1384,10 +1542,10 @@ class MainWindow(QDialog, Ui_Dialog):
         print(message)
     def closeEvent(self, event):
         """窗口关闭时停止线程"""
-        for t in ('timer', '_server_poll_timer'):
+        for t in ('timer', '_server_poll_timer', '_serial_retry_timer'):
             if hasattr(self, t) and hasattr(getattr(self, t), 'stop'):
                 getattr(self, t).stop()
-        if self.serial_thread and self.serial_thread.isRunning():
+        if self._serial_alive():
             self.serial_thread.stop()
         self.db.close()
         event.accept()

@@ -832,6 +832,29 @@ void ParseConfigCommand(char *json_str) {
         } else {
             HAL_UART_Transmit(&huart2, (uint8_t*)"OK\r\n", 4, 100);
         }
+    } else if (cmd && cJSON_IsString(cmd) && strcmp(cmd->valuestring, "get_params") == 0) {
+        /* 评分表 35 项"参数回写及一致性"补强：主动读回（纯查询，不改任何值）。
+         *
+         * 动机：set_params_ack 只在"下发之后"才回显，于是拔插串口 / 单片机
+         * 复位（固件参数回到编译默认值）之后，上位机无从知道单片机里到底在
+         * 用哪一组参数 —— 两端失配但界面上看不出来。上位机在串口连上后先跑
+         * 这条命令把单片机真实值读出来展示，再下发 set_params 纠正。
+         *
+         * 回显字段与 set_params_ack 完全一致（cut_in/rated_wind/cut_out/
+         * rated_power/mode），只有 cmd 名字不同，方便上位机走同一套渲染。
+         * ⚠ 两处回显内容必须保持一致，改一处记得改另一处。 */
+        cJSON *ack = cJSON_CreateObject();
+        if (ack != NULL) {
+            cJSON_AddStringToObject(ack, "cmd", "get_params_ack");
+            cJSON_AddNumberToObject(ack, "cut_in", g_wind_params.cut_in);
+            cJSON_AddNumberToObject(ack, "rated_wind", g_wind_params.rated_wind);
+            cJSON_AddNumberToObject(ack, "cut_out", g_wind_params.cut_out);
+            cJSON_AddNumberToObject(ack, "rated_power", g_wind_params.rated_power);
+            cJSON_AddNumberToObject(ack, "mode", g_control_mode);
+            SendConfigAck(ack);
+        } else {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"ERROR\r\n", 7, 100);
+        }
     } else if (cmd && cJSON_IsString(cmd) && strcmp(cmd->valuestring, "set_server") == 0) {
         /* 评分表 34 项"能在界面设置通信IP地址"：更新 A 端服务器地址并
          * 立即用新地址重连。回显实际生效的 ip/port 供上位机比对。 */
