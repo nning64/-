@@ -328,31 +328,45 @@ class MainWindow(QDialog, Ui_Dialog):
         self.seed_live_curves()
 
     def seed_live_curves(self):
-        """程序启动时一次性把数据库已有快照载入缓存（取最近 live_max_points 条）
+        """程序启动时把数据库里**最后一段连续快照**载入缓存。
 
-        防御性去重：DB 里若因单片机重启出现同 timestamp 的多条脏数据，
-        按 timestamp 只保留 id 最大（最新）那条——避免在同一个仿真秒画
-        多条垂直堆叠的曲线段。"""
+        ⚠️ 不能按 timestamp 全量去重合并后整段载入：
+        DB 里会留存 A 端**多次运行**的数据（实测有跑到 ts=688 的旧 run，
+        也有重启回 ts=16 的新 run）。全量合并后 latest 会被顶到旧 run 的
+        最大值 688，于是 X 轴窗口 [latest-600, latest] 整个跑到旧数据上
+        ——现象就是"仿真时刻才 45s，横轴却画到 650"。
+
+        正确口径：按 **id 升序**回放（id = 写入顺序 = 真实时间顺序），
+        遇到 ts 回退（A 重启 / 上一个 run 结束）就把已累积的段丢弃、
+        只保留最后一段——与运行期 refresh_ui 的 ts 回退重置完全一致。
+        ts 相同的行只保留最先写的那条（与运行期去重口径一致）。
+        """
         try:
             cur = self.db.conn.cursor()
             cur.execute(
-                "SELECT id, timestamp, wind_speed, output_power, pitch_angle "
+                "SELECT timestamp, wind_speed, output_power, pitch_angle "
                 "FROM history_control ORDER BY id DESC LIMIT ?",
-                (self.live_max_points * 2,),  # 多拉一些用于抵消去重损失
+                (self.live_max_points * 4,),  # 多拉一些，抵消重启频繁时段的丢弃
             )
-            rows = cur.fetchall()
-            # 按 timestamp 去重（保留 id 最大的——即最后写入的那条）
-            by_ts: dict[int, tuple] = {}
-            for r in rows:
-                ts = r[1]
-                if ts not in by_ts or r[0] > by_ts[ts][0]:
-                    by_ts[ts] = r
-            # 转成时间升序，截到 live_max_points
-            unique = sorted(by_ts.values(), key=lambda x: x[1])[-self.live_max_points:]
-            self.live_times = [r[1] for r in unique]
-            self.live_winds = [r[2] for r in unique]
-            self.live_powers = [r[3] for r in unique]
-            self.live_pitches = [r[4] for r in unique]
+            rows = cur.fetchall()[::-1]  # 反转成 id 升序
+            times, winds, powers, pitches = [], [], [], []
+            for ts, wind, power, pitch in rows:
+                if ts is None:
+                    continue
+                if times and ts < times[-1]:
+                    # ts 回退：上一个 run 结束 / A 重启，丢弃旧段重新累积
+                    times, winds, powers, pitches = [], [], [], []
+                elif times and ts == times[-1]:
+                    continue  # 同一仿真秒重复写入，只留第一条
+                times.append(ts)
+                winds.append(wind)
+                powers.append(power)
+                pitches.append(pitch)
+            n = self.live_max_points
+            self.live_times = times[-n:]
+            self.live_winds = winds[-n:]
+            self.live_powers = powers[-n:]
+            self.live_pitches = pitches[-n:]
             self.refresh_live_curves()
         except Exception as e:
             print(f"[seed_live_curves] 初始化曲线缓存失败: {e}")
