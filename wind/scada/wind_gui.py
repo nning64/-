@@ -358,17 +358,27 @@ class MainWindow(QDialog, Ui_Dialog):
             print(f"[seed_live_curves] 初始化曲线缓存失败: {e}")
 
     def refresh_live_curves(self):
-        """用全量缓存重绘三条曲线，并把 X 轴视图滚动到最新窗口尾部"""
+        """用全量缓存重绘三条曲线，并把 X 轴视图滚动到最新窗口尾部
+
+        X 轴策略：
+        - 起点 = max(live_times[0], latest - 600)：缓存最早点 vs 最近10分钟，取大者
+          → 仿真刚启动时（live_times[0]=30, latest=30）起点=30，不会出现负值
+          → 仿真跑久后起点=latest-600，窗口自然滚动
+        - 终点 = latest + 5（留 5 秒缓冲避免曲线贴边）
+        - 早于起点的点不裁剪，但 X 轴只显示 [x_min, x_max]，pyqtgraph 自动裁。
+        """
         if not self.live_times:
             return
         self.curve_wind.setData(self.live_times, self.live_winds)
         self.curve_power.setData(self.live_times, self.live_powers)
         self.curve_pitch.setData(self.live_times, self.live_pitches)
         latest = self.live_times[-1]
-        x_min = latest - self.live_window_seconds
+        earliest = self.live_times[0]
+        # 起点：要么从缓存最早点起（仿真刚跑不久），要么最近 10 分钟（已跑久）
+        x_min = max(earliest, latest - self.live_window_seconds)
+        x_max = latest + 5
         for plot in (self.plot_wind, self.plot_power, self.plot_pitch):
-            # 让 X 轴始终跟随最新时间戳滚动到当前窗口尾部
-            plot.setXRange(x_min, latest, padding=0.02)
+            plot.setXRange(x_min, x_max, padding=0.02)
 
     def _setup_curve_hover(self, plot, curve, name, unit):
         """给指定 plot 内的 curve 绑定鼠标悬浮事件。
@@ -1178,19 +1188,20 @@ class MainWindow(QDialog, Ui_Dialog):
             row = cur.fetchone()
             if row:
                 ts, wind, power, pitch = row
-                # 第一条数据 或者 比缓存最后一条还新（>5s 节流写入保证时间戳严格递增）
-                if not self.live_times or ts > self.live_times[-1]:
+                # 增量 append：去重（相同 ts 不重复），但允许 ts 回退
+                # （A 重启归零后曲线从 0 自然开始新一段，不要卡住）。
+                if not self.live_times or ts != self.live_times[-1]:
                     self.live_times.append(ts)
                     self.live_winds.append(wind)
                     self.live_powers.append(power)
                     self.live_pitches.append(pitch)
-                    # 超过上限则 trim 最早的点（保留尾部 live_max_points）
-                    if len(self.live_times) > self.live_max_points:
-                        self.live_times = self.live_times[-self.live_max_points:]
-                        self.live_winds = self.live_winds[-self.live_max_points:]
-                        self.live_powers = self.live_powers[-self.live_max_points:]
-                        self.live_pitches = self.live_pitches[-self.live_max_points:]
-                    self.refresh_live_curves()
+                # 超过上限则 trim 最早的点（保留尾部 live_max_points）
+                if len(self.live_times) > self.live_max_points:
+                    self.live_times = self.live_times[-self.live_max_points:]
+                    self.live_winds = self.live_winds[-self.live_max_points:]
+                    self.live_powers = self.live_powers[-self.live_max_points:]
+                    self.live_pitches = self.live_pitches[-self.live_max_points:]
+                self.refresh_live_curves()
 
             # 当前风机参数只读列（device_params 目标值 + 实时遥测实测值）
             self.refresh_current_params()
