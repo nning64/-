@@ -222,6 +222,20 @@ class MainWindow(QDialog, Ui_Dialog):
         self.gridLayout_9.addWidget(self.echo_log_caption, 9, 0, 1, 2)
         self.gridLayout_9.addWidget(self.echo_log, 10, 0, 1, 2)
 
+        # "单片机实际生效参数"逐项回显区（评分表 35 项）：回显的判据是"能把
+        # 单片机里的参数展示到上位机界面"，不是给一个 ✓ 就完事。每次收到
+        # set_params_ack / get_params_ack 后，把单片机控制算法真正在用的
+        # 每个值逐项摆出来，并与界面下发值左右对照。
+        self.mcu_params_caption = QLabel("单片机实际生效参数（回显值）")
+        self.mcu_params_caption.setStyleSheet("font-weight:bold;")
+        self.mcu_params_view = QTextEdit()
+        self.mcu_params_view.setReadOnly(True)
+        self.mcu_params_view.setFixedHeight(104)
+        self.mcu_params_view.setStyleSheet("font-size:12px;")
+        self.mcu_params_view.setPlainText("（尚未收到单片机回显）")
+        self.gridLayout_9.addWidget(self.mcu_params_caption, 11, 0, 1, 2)
+        self.gridLayout_9.addWidget(self.mcu_params_view, 12, 0, 1, 2)
+
         # 定时刷新界面（每秒）
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh_ui)
@@ -725,30 +739,128 @@ class MainWindow(QDialog, Ui_Dialog):
                         ok, detail = True, "已下发并收到回显"
                     except json.JSONDecodeError:
                         ok, detail = True, f"已下发（回显帧无法解析: {reply[:60]}）"
-                    if expect and ack is not None:
+                    if ack is not None and (expect or self._ack_has_params(ack)):
+                        # 进这里的两种情况：
+                        #  a) 带了 expect（set_params / set_server）→ 要逐项比对
+                        #  b) 回显帧自带风机参数（get_params 主动读回）→ 有值可展示
+                        # 排除：get_server 的 10s 周期轮询（expect=None 且 ack
+                        # 只有 ip/port），否则会刷参数区、结论行和 run_logs。
                         diffs = []
-                        for key, want in expect.items():
-                            got = ack.get(key)
-                            if isinstance(want, float):
-                                if got is None or abs(float(got) - want) > 1e-6:
+                        if expect:
+                            for key, want in expect.items():
+                                got = ack.get(key)
+                                if isinstance(want, float):
+                                    if got is None or abs(float(got) - want) > 1e-6:
+                                        diffs.append(f"{key}: 界面={want} 单片机={got}")
+                                elif got != want:
                                     diffs.append(f"{key}: 界面={want} 单片机={got}")
-                            elif got != want:
-                                diffs.append(f"{key}: 界面={want} 单片机={got}")
                         if diffs:
-                            self._show_mcu_echo(False, "; ".join(diffs), cmd_obj.get("cmd", ""))
+                            self._show_mcu_echo(False, "; ".join(diffs), cmd_obj.get("cmd", ""),
+                                                ack=ack, expect=expect)
                             ok, detail = False, "回显不一致 → " + "; ".join(diffs)
-                        else:
-                            self._show_mcu_echo(True, f"{len(expect)} 项全部一致", cmd_obj.get("cmd", ""))
+                        elif expect:
+                            self._show_mcu_echo(True, f"{len(expect)} 项全部一致", cmd_obj.get("cmd", ""),
+                                                ack=ack, expect=expect)
                             detail = f"已下发且单片机回显一致 ✓（{len(expect)} 项全部匹配）"
+                        else:
+                            # 主动读回（get_params，无期望值）：只把单片机当前
+                            # 参数值摆到界面上，不写结论行/验证记录，避免污染证据链
+                            self._render_mcu_params(ack, expect=None)
         if return_ack:
             return ok, detail, ack
         return ok, detail
 
-    def _show_mcu_echo(self, ok, detail, cmd_name=""):
-        """把单片机回显比对结果常驻显示在"当前风机参数"面板末行。
+    # 单片机回显参数字段的展示规格：(json 键, 中文名, 单位)
+    _MCU_ECHO_SPEC = (
+        ("cut_in",      "切入风速", "m/s"),
+        ("rated_wind",  "额定风速", "m/s"),
+        ("cut_out",     "切出风速", "m/s"),
+        ("rated_power", "额定功率", "kW"),
+        ("mode",        "控制模式", ""),
+    )
+
+    def _ack_has_params(self, ack):
+        """回显帧里是否含风机参数字段。
+
+        用来把"参数回显"（set_params_ack / get_params_ack）与"服务器地址
+        查询回显"（get_server_ack，10s 周期轮询）区分开——后者不该刷参数
+        展示区、结论行和 run_logs。"""
+        return isinstance(ack, dict) and any(
+            k in ack for k, _cn, _u in self._MCU_ECHO_SPEC)
+
+    def _fmt_param_value(self, key, val):
+        """把参数值格式化成界面展示文本（mode 是枚举，转成'开环/闭环'）。"""
+        if val is None:
+            return "—"
+        if key == "mode":
+            try:
+                return "闭环" if int(val) == 1 else "开环"
+            except (TypeError, ValueError):
+                return str(val)
+        for k, _cn, unit in self._MCU_ECHO_SPEC:
+            if k == key:
+                try:
+                    return f"{float(val):.2f} {unit}".strip()
+                except (TypeError, ValueError):
+                    return str(val)
+        return str(val)
+
+    def _render_mcu_params(self, ack, expect=None):
+        """把单片机回显的参数值逐项渲染到"单片机实际生效参数"区。
+
+        评分表 35 项的判据是"能把单片机里的参数展示到上位机界面"，
+        而不是只给一个 ✓/✗ 结论。左列=界面下发值，右列=**单片机实际生效值**
+        （加粗，主角），逐项对照标注。没有下发期望值时（如主动读回），
+        也照样把单片机当前值全部列出来。"""
+        ts = datetime.now().strftime("%H:%M:%S")
+        expect = expect or {}
+        rows_html = []
+        for key, cname, _unit in self._MCU_ECHO_SPEC:
+            if key not in ack:
+                continue
+            mcu_txt = self._fmt_param_value(key, ack.get(key))
+            if key in expect:
+                ui_txt = self._fmt_param_value(key, expect.get(key))
+                try:
+                    if key == "mode":
+                        same = int(ack.get(key)) == int(expect.get(key))
+                    else:
+                        same = abs(float(ack.get(key)) - float(expect.get(key))) < 1e-6
+                except (TypeError, ValueError):
+                    same = False
+                mark = "✓" if same else "✗"
+                color = "#26a269" if same else "#e01b24"
+            else:
+                ui_txt, mark, color = "—", "", "#888888"
+            rows_html.append(
+                "<tr>"
+                f"<td style='padding:1px 6px;'>{cname}</td>"
+                f"<td style='padding:1px 6px;' align='right'>{ui_txt}</td>"
+                f"<td style='padding:1px 6px;' align='right'><b>{mcu_txt}</b></td>"
+                f"<td style='padding:1px 6px;color:{color};'>{mark}</td>"
+                "</tr>"
+            )
+        if not rows_html:
+            return
+        html = (
+            "<table cellspacing='0' cellpadding='0' style='font-size:12px;'>"
+            "<tr style='color:#888888;'>"
+            "<td style='padding:1px 6px;'>参数</td>"
+            "<td style='padding:1px 6px;' align='right'>界面下发</td>"
+            "<td style='padding:1px 6px;' align='right'>单片机生效</td>"
+            "<td style='padding:1px 6px;'></td></tr>"
+            + "".join(rows_html)
+            + "</table>"
+            + f"<div style='font-size:11px;color:#888888;'>回显时间 {ts}</div>"
+        )
+        self.mcu_params_view.setHtml(html)
+
+    def _show_mcu_echo(self, ok, detail, cmd_name="", ack=None, expect=None):
+        """把单片机回显比对结论常驻显示在"当前风机参数"面板末行，
+        并把回显的**参数值本身**逐项渲染到"单片机实际生效参数"区。
 
         评分表 35 项判据是"单片机计算所用参数 == 界面显示值"——
-        日志一闪而过，验收时把这个结论挂在参数栏里随时可见。
+        日志一闪而过，验收时把值直接挂在参数栏里随时可见。
         同时追加到"一致性验证记录"滚动区并写 run_logs 表，形成完整证据链。"""
         ts = datetime.now().strftime("%H:%M:%S")
         tag = cmd_name or "cmd"
@@ -760,6 +872,13 @@ class MainWindow(QDialog, Ui_Dialog):
             self.mcu_echo_label.setText(f"✗ 不一致: {detail} @ {ts}")
             self.mcu_echo_label.setStyleSheet("font-weight:bold; color:#e01b24;")
             record = f"[{ts}] ✗ {tag}: {detail}"
+
+        # 回显值逐项展示 —— 核心：把单片机里的参数摆到界面上
+        if ack:
+            try:
+                self._render_mcu_params(ack, expect)
+            except Exception as e:
+                print(f"_render_mcu_params 错误: {e}")
 
         # 追加到验证记录区（保留最近 100 条）
         if hasattr(self, 'echo_log'):
