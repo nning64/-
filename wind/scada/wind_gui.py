@@ -1188,9 +1188,33 @@ class MainWindow(QDialog, Ui_Dialog):
             row = cur.fetchone()
             if row:
                 ts, wind, power, pitch = row
-                # 增量 append：去重（相同 ts 不重复），但允许 ts 回退
-                # （A 重启归零后曲线从 0 自然开始新一段，不要卡住）。
-                if not self.live_times or ts != self.live_times[-1]:
+                # 增量 append：三种情形分别处理
+                # 1) 首次：直接 append
+                # 2) ts 等于最后一个：重复（save_control_snapshot 1Hz 节流 + 1Hz 定时器
+                #    双触发会读同一行），跳过
+                # 3) ts < 最后一个：A 重启了（实测 sim_time 会跳回 16 这种小值，
+                #    DB 里 ts=16 出现 19 次就是这个原因），此时**清空缓存、从新 ts 重建段**，
+                #    否则新段 ts 会和旧段在同 x 上叠点，pyqtgraph 画出"两条线"
+                # 4) ts > 最后一个：正常递增，append
+                if not self.live_times:
+                    self.live_times.append(ts)
+                    self.live_winds.append(wind)
+                    self.live_powers.append(power)
+                    self.live_pitches.append(pitch)
+                elif ts == self.live_times[-1]:
+                    pass  # 重复帧，跳过
+                elif ts < self.live_times[-1]:
+                    # ts 回退 = A 重启，重置 live 缓存（seed 旧段作废）
+                    self.status_updated.emit(
+                        f"[INFO] 检测到 A 端 sim_time 回退 {self.live_times[-1]:.0f}→{ts:.0f}，"
+                        f"曲线重置从新段开始"
+                    )
+                    self.live_times = [ts]
+                    self.live_winds = [wind]
+                    self.live_powers = [power]
+                    self.live_pitches = [pitch]
+                else:
+                    # ts > last，正常递增
                     self.live_times.append(ts)
                     self.live_winds.append(wind)
                     self.live_powers.append(power)
