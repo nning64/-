@@ -609,53 +609,64 @@ class MainWindow(QDialog, Ui_Dialog):
         self.log(f"控制模式切换为【{mode_name}】，正在下发到单片机...")
         self.save_params(show_dialog=False)
 
-    def _send_config_cmd(self, cmd_obj, expect=None, timeout=5.0):
+    def _send_config_cmd(self, cmd_obj, expect=None, timeout=5.0, return_ack=False):
         """通过串口线程下发配置命令并等待固件应答（评分表 35 项核心）。
 
-        cmd_obj:  要序列化成 JSON 的命令对象（set_params / set_server）
+        cmd_obj:  要序列化成 JSON 的命令对象（set_params / set_server / get_server）
         expect:   期望固件回显的参数值 {键: 期望值}。新固件应答帧里带
                   单片机实际生效的参数，逐项与期望值比对：
                   全部一致 → ok=True；任何一项不一致 → ok=False 并列出差异。
                   传 None 表示不比对（只确认收到应答）。
-        返回 (ok, detail)：detail 是可直接打日志的中文说明。
+        return_ack: True 时返回三元组 (ok, detail, ack_dict|None)，把应答帧
+                  原文也交给调用方——get_server 这类查询命令的应答是"数据"
+                  而不是"比对结果"，调用方要读 ip/port 字段。
+        返回 (ok, detail) 或 (ok, detail, ack)。detail 是可直接打日志的中文说明。
         """
+        ack = None
         if not (self.serial_thread and self.serial_thread.isRunning()):
-            return False, "串口未连接，命令未下发"
-        t = self.serial_thread
-        t.cfg_event.clear()
-        t.cfg_reply = None
-        t.cmd_queue.put(json.dumps(cmd_obj))
-        # 固件主循环 1s 一拍处理 rx2，应答最长约 2s，放宽到 5s
-        if not t.cfg_event.wait(timeout=timeout):
-            return False, "固件应答超时"
-        reply = t.cfg_reply
-        if reply == "ERROR":
-            return False, "单片机 JSON 解析失败"
-        if reply == "UNKNOWN_CMD":
-            return False, "单片机不认识该命令（固件版本过旧，需重新烧录）"
-        if reply == "OK":
-            # 旧固件只回 OK，无法验证一致性
-            return True, "已下发（旧固件只回 OK，无回显可比对）"
-        # 新固件：JSON 回显帧（{"cmd":"..._ack", ...实际生效值}）
-        try:
-            ack = json.loads(reply)
-        except json.JSONDecodeError:
-            return True, f"已下发（回显帧无法解析: {reply[:60]}）"
-        if expect:
-            diffs = []
-            for key, want in expect.items():
-                got = ack.get(key)
-                if isinstance(want, float):
-                    if got is None or abs(float(got) - want) > 1e-6:
-                        diffs.append(f"{key}: 界面={want} 单片机={got}")
-                elif got != want:
-                    diffs.append(f"{key}: 界面={want} 单片机={got}")
-            if diffs:
-                self._show_mcu_echo(False, "; ".join(diffs), cmd_obj.get("cmd", ""))
-                return False, "回显不一致 → " + "; ".join(diffs)
-            self._show_mcu_echo(True, f"{len(expect)} 项全部一致", cmd_obj.get("cmd", ""))
-            return True, f"已下发且单片机回显一致 ✓（{len(expect)} 项全部匹配）"
-        return True, "已下发并收到回显"
+            ok, detail = False, "串口未连接，命令未下发"
+        else:
+            t = self.serial_thread
+            t.cfg_event.clear()
+            t.cfg_reply = None
+            t.cmd_queue.put(json.dumps(cmd_obj))
+            # 固件主循环 1s 一拍处理 rx2，应答最长约 2s，放宽到 5s
+            if not t.cfg_event.wait(timeout=timeout):
+                ok, detail = False, "固件应答超时"
+            else:
+                reply = t.cfg_reply
+                if reply == "ERROR":
+                    ok, detail = False, "单片机 JSON 解析失败"
+                elif reply == "UNKNOWN_CMD":
+                    ok, detail = False, "单片机不认识该命令（固件版本过旧，需重新烧录）"
+                elif reply == "OK":
+                    # 旧固件只回 OK，无法验证一致性
+                    ok, detail = True, "已下发（旧固件只回 OK，无回显可比对）"
+                else:
+                    # 新固件：JSON 回显帧（{"cmd":"..._ack", ...实际生效值}）
+                    try:
+                        ack = json.loads(reply)
+                        ok, detail = True, "已下发并收到回显"
+                    except json.JSONDecodeError:
+                        ok, detail = True, f"已下发（回显帧无法解析: {reply[:60]}）"
+                    if expect and ack is not None:
+                        diffs = []
+                        for key, want in expect.items():
+                            got = ack.get(key)
+                            if isinstance(want, float):
+                                if got is None or abs(float(got) - want) > 1e-6:
+                                    diffs.append(f"{key}: 界面={want} 单片机={got}")
+                            elif got != want:
+                                diffs.append(f"{key}: 界面={want} 单片机={got}")
+                        if diffs:
+                            self._show_mcu_echo(False, "; ".join(diffs), cmd_obj.get("cmd", ""))
+                            ok, detail = False, "回显不一致 → " + "; ".join(diffs)
+                        else:
+                            self._show_mcu_echo(True, f"{len(expect)} 项全部一致", cmd_obj.get("cmd", ""))
+                            detail = f"已下发且单片机回显一致 ✓（{len(expect)} 项全部匹配）"
+        if return_ack:
+            return ok, detail, ack
+        return ok, detail
 
     def _show_mcu_echo(self, ok, detail, cmd_name=""):
         """把单片机回显比对结果常驻显示在"当前风机参数"面板末行。
@@ -824,6 +835,37 @@ class MainWindow(QDialog, Ui_Dialog):
         时间进入读循环，避免阻塞启动画面。"""
         QTimer.singleShot(500, self._do_post_connect_sync)
 
+    def _query_fw_server(self):
+        """向固件查询当前实际使用的服务器地址（get_server 命令）。
+
+        场景：固件开机联网时打的 "TCP -> ip:port" 行，通常在 GUI 连上串口
+        之前就发过去了——界面"当前服务器"会一直停在"待固件上报"。
+        每次串口连接成功后主动查一次，把固件此刻真正在用的地址显示出来，
+        顺带回填 IP 输入框（在此基础上改地址比从空白敲方便）。
+        返回 (ip, port)；查询失败返回 (None, None)。"""
+        fw_ip, fw_port = None, None
+        try:
+            ok, detail, ack = self._send_config_cmd({"cmd": "get_server"}, return_ack=True)
+            if ok and isinstance(ack, dict) and ack.get("ip"):
+                fw_ip = str(ack["ip"])
+                fw_port = int(ack.get("port") or 0)
+                online = bool(ack.get("link_up"))
+                self._set_link_server(
+                    f"{fw_ip}:{fw_port}",
+                    "链路在线 ✓" if online else "链路未建立/重连中",
+                    "#26a269" if online else "#777")
+                if not self.ip_edit.text().strip():
+                    self.ip_edit.setText(fw_ip)
+                if fw_port:
+                    self.port_spin.setValue(fw_port)
+                self.log(f"✅ 固件当前服务器: {fw_ip}:{fw_port}"
+                         f"（{'链路在线' if online else '链路未建立'}）")
+            else:
+                self.log(f"⚠️ 查询固件服务器地址: {detail}")
+        except Exception as e:
+            self.log(f"⚠️ 查询固件服务器地址失败: {e}")
+        return fw_ip, fw_port
+
     def _do_post_connect_sync(self):
         # 线程可能已在此期间退出（如立即断连），先确认还活着
         if not (self.serial_thread and self.serial_thread.isRunning()):
@@ -848,16 +890,27 @@ class MainWindow(QDialog, Ui_Dialog):
         except Exception as e:
             self.log(f"⚠️ 连接后参数自动同步失败: {e}")
 
-        # 服务器地址：仅当用户在界面设置过（DB 里非初始占位值）才推送
+        # 查询固件当前服务器地址并显示（评分表 34 项：界面上能随时看出
+        # 固件连的是哪个地址、IP 改没改生效）。固件开机 WiFi 初始化会
+        # 阻塞十余秒，此时查询会超时——4 秒后自动重试一次。
+        fw_ip, fw_port = self._query_fw_server()
+        if fw_ip is None:
+            QTimer.singleShot(4000, self._query_fw_server)
+
+        # 服务器地址：仅当用户在界面设置过（DB 里非初始占位值）且与固件
+        # 当前值不一致时才推送——一致就不必白白触发一次断链重连
         try:
             cur = self.db.conn.cursor()
             cur.execute("SELECT ip_addr, port FROM rtu_info WHERE id=1")
             row = cur.fetchone()
             if row and row[0] and row[0] not in ("127.0.0.1", ""):
-                ok, detail = self._send_config_cmd({
-                    "cmd": "set_server", "ip": row[0], "port": row[1]
-                }, expect={"ip": row[0], "port": int(row[1])})
-                self.log(("✅ " if ok else "⚠️ ") + f"连接后服务器地址同步: {detail}")
+                if fw_ip == row[0] and fw_port == int(row[1] or 0):
+                    self.log(f"✅ 服务器地址与固件一致（{fw_ip}:{fw_port}），无需同步")
+                else:
+                    ok, detail = self._send_config_cmd({
+                        "cmd": "set_server", "ip": row[0], "port": row[1]
+                    }, expect={"ip": row[0], "port": int(row[1])})
+                    self.log(("✅ " if ok else "⚠️ ") + f"连接后服务器地址同步: {detail}")
         except Exception as e:
             self.log(f"⚠️ 连接后服务器地址同步失败: {e}")
 

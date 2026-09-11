@@ -711,6 +711,15 @@ static uint8_t LinkReconnect(void) {
     HAL_UART_AbortReceive_IT(&huart1);
     DebugPrint("LINK LOST, reconnecting...\r\n");
 
+    /* 重连目标地址上报（与 WiFi_Init 的 "TCP -> " 行一致）：
+       界面"当前服务器"据此显示重连中的实际地址——尤其是 set_server
+       改过地址后，这一行是"新地址已生效"的直接证据。 */
+    {
+        char tip[64];
+        sprintf(tip, "TCP -> %s:%d\r\n", g_server_ip, g_server_port);
+        DebugPrint(tip);
+    }
+
     /* 退出透传"会话"（TCP 连接本身还挂着，后面 CIPCLOSE 负责关）。
        AT 固件要求 +++ 前后各 >1s 静默，否则不生效。 */
     LinkWaitYield(1100);
@@ -853,6 +862,23 @@ void ParseConfigCommand(char *json_str) {
             SendConfigAck(ack);
         } else if (valid) {
             HAL_UART_Transmit(&huart2, (uint8_t*)"OK\r\n", 4, 100);
+        } else {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"ERROR\r\n", 7, 100);
+        }
+    } else if (cmd && cJSON_IsString(cmd) && strcmp(cmd->valuestring, "get_server") == 0) {
+        /* 评分表 34 项补强：查询固件当前实际使用的服务器地址。
+         * 动机："TCP -> ip:port" 只在 WiFi_Init/LinkReconnect 时打印，
+         * 上位机通常在固件联网之后才连上串口，那行早就错过了——
+         * 界面"当前服务器"会一直停在"待固件上报"。
+         * 上位机每次串口连接成功后主动查询一次，这里回显 g_server_ip/port
+         * （含链路状态），界面随即显示固件此刻真正在用的地址。 */
+        cJSON *ack = cJSON_CreateObject();
+        if (ack != NULL) {
+            cJSON_AddStringToObject(ack, "cmd", "get_server_ack");
+            cJSON_AddStringToObject(ack, "ip", g_server_ip);
+            cJSON_AddNumberToObject(ack, "port", (double)g_server_port);
+            cJSON_AddBoolToObject(ack, "link_up", g_link_up ? 1 : 0);
+            SendConfigAck(ack);
         } else {
             HAL_UART_Transmit(&huart2, (uint8_t*)"ERROR\r\n", 7, 100);
         }
