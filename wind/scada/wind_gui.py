@@ -68,18 +68,14 @@ class SerialReceiverThread(QThread):
 
         last_grid_time = 0
         last_raw_ts = 0
-        # 单片机复位检测：当前 PUSH ts 比上次小超过 RESET_GAP_MS（10s）视为
-        # 时钟源回退（掉电/复位后从 0 重新累加），session_offset_ms 累加偏移，
-        # 让 timestamp 严格单调递增。
+        # v0.4 起 PUSH 帧 ts = 单片机 sim_time × 1000，而 sim_time 由 A HEART
+        # 权威覆盖（A 重启时归零是预期行为）。所以 ts 本身就是"绝对仿真时刻"，
+        # 不需要任何偏移 —— 直接写入即可。
         #
-        # v0.4 起 ts 语义变更：PUSH 帧 ts = 单片机 sim_time × 1000，而 sim_time
-        # 在 A 在线时被 A 的 HEART 覆盖为 A 的权威仿真时刻。也就是说 ts 已经是
-        # "A 的绝对时间轴"，不再需要启动时用 DB max 反推 offset —— 那两个时间轴
-        # 本来就同源，叠加偏移反而会把对齐好的数据整体顶高（曾出现 A 端 77s、
-        # GUI 显示 99000+s 的错位，根因就是这里叠加了旧格式遗留的 DB max）。
-        # 所以：启动 offset 恒为 0，仅在运行期检测到 ts 回退时才累加。
+        # 保留一段 INFO 日志：检测到 ts 回退（典型场景：A 重启 / A 暂停后恢复）
+        # 提示用户"曲线会从这里重新开始"，便于排查"为什么这里断了一段"。
+        # 但 effective_ts 不再加偏移，保持与 A 完全一致。
         RESET_GAP_MS = 10000
-        session_offset_ms = 0
         while self.running:
             # 1) 把排队的配置命令发出去（本线程是串口唯一写者）
             try:
@@ -116,19 +112,23 @@ class SerialReceiverThread(QThread):
                 kind, payload = parse_stm32_line(line, db, status_cb=on_status)
 
                 if kind == 'json' and payload == 'PUSH':
-                    # 用帧内时间戳（单片机上电毫秒）作为仿真时刻
+                    # v0.4 起 PUSH 帧 ts = 单片机 sim_time × 1000（被 A HEART
+                    # 覆盖为 A 的绝对仿真时刻）。直接保存即可，不再叠加 offset。
                     try:
                         ts = json.loads(line).get('ts', 0)
-                        if ts:
-                            # 检测单片机复位：当前 ts 比上次小很多 → 累加偏移
+                        # ts=0 是合法值（A 刚启动 / 重启归零瞬间），
+                        # 不能用 `if ts:` 把它当 None 漏掉
+                        if ts is not None:
+                            # 检测 A 重启 / sim_time 回退：仅打 INFO 提示用户，
+                            # 不改写入值（A 重启后曲线从这里自然开始新一段）。
                             if last_raw_ts and ts < last_raw_ts - RESET_GAP_MS:
-                                session_offset_ms += last_raw_ts + RESET_GAP_MS
                                 self.status_updated.emit(
-                                    f"[INFO] 检测到单片机复位 session_offset={session_offset_ms}ms"
+                                    f"[INFO] 检测到 A 端 sim_time 回退 "
+                                    f"({last_raw_ts/1000:.0f}s → {ts/1000:.0f}s)，"
+                                    f"曲线将从这里重新开始"
                                 )
                             last_raw_ts = ts
-                            effective_ts = ts + session_offset_ms
-                            last_grid_time = effective_ts / 1000.0
+                            last_grid_time = ts / 1000.0
                     except json.JSONDecodeError:
                         pass
 
