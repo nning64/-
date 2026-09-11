@@ -199,6 +199,18 @@ class MainWindow(QDialog, Ui_Dialog):
         self.gridLayout_9.addWidget(self.mcu_echo_caption, 8, 0, 1, 1)
         self.gridLayout_9.addWidget(self.mcu_echo_label, 8, 1, 1, 1)
 
+        # "一致性验证记录"滚动区（评分表 35 项证据留痕）：每次参数/地址下发
+        # 后追加一行"时间 ✓/✗ 命令 结果"，验收时可翻看完整序列：
+        # 改参数 → 下发 → 单片机回显 → 与界面值逐项比对。
+        self.echo_log_caption = QLabel("一致性验证记录（界面值 vs 单片机回显）")
+        self.echo_log = QTextEdit()
+        self.echo_log.setReadOnly(True)
+        self.echo_log.setFixedHeight(96)
+        self.echo_log.setStyleSheet("font-size:12px;")
+        self._echo_records = []          # 供 setPlainText 重建，保留最近 100 条
+        self.gridLayout_9.addWidget(self.echo_log_caption, 9, 0, 1, 2)
+        self.gridLayout_9.addWidget(self.echo_log, 10, 0, 1, 2)
+
         # 定时刷新界面（每秒）
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh_ui)
@@ -639,26 +651,43 @@ class MainWindow(QDialog, Ui_Dialog):
                 elif got != want:
                     diffs.append(f"{key}: 界面={want} 单片机={got}")
             if diffs:
-                self._show_mcu_echo(False, "; ".join(diffs))
+                self._show_mcu_echo(False, "; ".join(diffs), cmd_obj.get("cmd", ""))
                 return False, "回显不一致 → " + "; ".join(diffs)
-            self._show_mcu_echo(True, f"{len(expect)} 项全部一致")
+            self._show_mcu_echo(True, f"{len(expect)} 项全部一致", cmd_obj.get("cmd", ""))
             return True, f"已下发且单片机回显一致 ✓（{len(expect)} 项全部匹配）"
         return True, "已下发并收到回显"
 
-    def _show_mcu_echo(self, ok, detail):
+    def _show_mcu_echo(self, ok, detail, cmd_name=""):
         """把单片机回显比对结果常驻显示在"当前风机参数"面板末行。
 
         评分表 35 项判据是"单片机计算所用参数 == 界面显示值"——
-        日志一闪而过，验收时把这个结论挂在参数栏里随时可见。"""
-        if not hasattr(self, 'mcu_echo_label'):
-            return
+        日志一闪而过，验收时把这个结论挂在参数栏里随时可见。
+        同时追加到"一致性验证记录"滚动区并写 run_logs 表，形成完整证据链。"""
         ts = datetime.now().strftime("%H:%M:%S")
+        tag = cmd_name or "cmd"
         if ok:
             self.mcu_echo_label.setText(f"✓ 一致（{detail}）@ {ts}")
             self.mcu_echo_label.setStyleSheet("font-weight:bold; color:#26a269;")
+            record = f"[{ts}] ✓ {tag}: {detail}"
         else:
             self.mcu_echo_label.setText(f"✗ 不一致: {detail} @ {ts}")
             self.mcu_echo_label.setStyleSheet("font-weight:bold; color:#e01b24;")
+            record = f"[{ts}] ✗ {tag}: {detail}"
+
+        # 追加到验证记录区（保留最近 100 条）
+        if hasattr(self, 'echo_log'):
+            self._echo_records.append(record)
+            self._echo_records = self._echo_records[-100:]
+            self.echo_log.setPlainText("\n".join(self._echo_records))
+            sb = self.echo_log.verticalScrollBar()
+            if sb:
+                sb.setValue(sb.maximum())      # 自动滚到最新一条
+
+        # 同步写数据库 run_logs 表（永久留痕，验收可查）
+        try:
+            self.db.insert_log("INFO" if ok else "ERROR", "ECHO", record)
+        except Exception:
+            pass    # 留痕失败不影响主流程
 
     def save_params(self, show_dialog=True):
         """保存参数：更新数据库 + 下发到单片机 + 回显一致性校验"""
@@ -870,6 +899,52 @@ class MainWindow(QDialog, Ui_Dialog):
         except Exception as e:
             print(f"[init_server_ip_controls] 读取历史IP失败: {e}")
 
+        # "当前服务器"常驻显示行（体现 IP 重连）：显示固件正在使用的服务器
+        # 地址 + 链路状态。三个驱动源：
+        #   1) apply_server_ip 下发成功 → "已下发，重连中…"
+        #   2) 固件状态行 "TCP -> x.x.x.x:p" → 固件用该地址发起新连接
+        #   3) 固件状态行 RECONNECT OK/FAIL、LINK LOST → 重连结果
+        server_wrap = QHBoxLayout()
+        server_wrap.addWidget(QLabel("当前服务器"))
+        self.link_server_label = QLabel("（待固件上报）")
+        self.link_server_label.setStyleSheet("font-weight:bold; color:#777;")
+        server_wrap.addWidget(self.link_server_label)
+        self.gridLayout_2.addLayout(server_wrap, 3, 0, 1, 3)
+
+        # 初始文案：数据库设置过就显示该地址（是否真的在用要等 TCP -> 行确认）
+        try:
+            cur.execute("SELECT ip_addr, port FROM rtu_info WHERE id=1")
+            row = cur.fetchone()
+            if row and row[0] and row[0] != "127.0.0.1":
+                self._set_link_server(f"{row[0]}:{int(row[1])}", "待固件上报确认", "#777")
+        except Exception as e:
+            print(f"[init_server_ip_controls] 初始化当前服务器显示失败: {e}")
+
+    def _set_link_server(self, addr, state, color):
+        """更新"当前服务器"行（IP 重连证据面板）。"""
+        if hasattr(self, 'link_server_label'):
+            self.link_server_label.setText(f"{addr} · {state}")
+            self.link_server_label.setStyleSheet(f"font-weight:bold; color:{color};")
+
+    def _update_link_server_from_status(self, body):
+        """从固件链路状态消息更新"当前服务器"行。
+
+        消息来自 STATUS_LINES 映射后的中文文案（wind_data_receiver），
+        以及 "TCP -> ip:port" 特判行（携带实际地址）。"""
+        if not hasattr(self, 'link_server_label'):
+            return
+        cur_text = self.link_server_label.text()
+        addr = cur_text.split(" · ")[0] if " · " in cur_text else ""
+        if "正在连接 TCP 服务器" in body:
+            addr = body.split("正在连接 TCP 服务器", 1)[1].strip() or addr
+            self._set_link_server(addr, "正在连接…", "orange")
+        elif "链路已恢复" in body:
+            self._set_link_server(addr or "未知地址", "链路已恢复并完成注册 ✓", "#26a269")
+        elif "重连失败" in body:
+            self._set_link_server(addr or "未知地址", "重连失败，持续重试中", "#e01b24")
+        elif "链路断开" in body:
+            self._set_link_server(addr or "未知地址", "链路断开，正在重连…", "#e01b24")
+
     def apply_server_ip(self):
         """校验 → 存库 → 下发 set_server → 比对回显。
 
@@ -902,6 +977,7 @@ class MainWindow(QDialog, Ui_Dialog):
             expect={"ip": ip, "port": int(port)})
         if ok:
             self.log(f"✅ 服务器地址 {ip}:{port} {detail}，单片机正在用新地址重连...")
+            self._set_link_server(f"{ip}:{port}", "已下发，重连中…", "orange")
             QMessageBox.information(
                 self, "已应用",
                 f"服务器地址已下发: {ip}:{port}\n单片机将断开当前连接并用新地址重连，\n"
@@ -927,6 +1003,8 @@ class MainWindow(QDialog, Ui_Dialog):
             else:
                 self.label_21.setText(f"🟢 {msg}")
                 self.label_21.setStyleSheet("color: green;")
+            # 同步更新"当前服务器"行（TCP -> x / RECONNECT OK/FAIL / LINK LOST）
+            self._update_link_server_from_status(msg)
         else:
             # 串口自身连接状态（串口打开失败/接收错误断开/已连接）。
             # 用"已连接"判断，任何非正常的串口消息都按失败/断开处理。

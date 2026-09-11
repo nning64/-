@@ -151,6 +151,16 @@ def parse_stm32_line(line, db, status_cb=None):
         return "json", code
 
     # ---- 文本状态行 ----
+    # 特判 "TCP -> ip:port"：目标地址是运行时变量（上位机 set_server 可改），
+    # 静态映射表携带不了——单独解析，把实际地址带进状态消息，
+    # 界面"当前服务器"行才能显示固件此刻正在连哪个地址（IP 重连的直接证据）。
+    if line.startswith("TCP -> "):
+        msg = "正在连接 TCP 服务器 " + line[len("TCP -> "):].strip()
+        db.insert_log("INFO", "STM32", msg)
+        if status_cb:
+            status_cb("INFO", msg)
+        return "status", ("INFO", msg)
+
     for prefix, level, message, wifi in STATUS_LINES:
         if line.startswith(prefix):
             db.insert_log(level, "STM32", message)
