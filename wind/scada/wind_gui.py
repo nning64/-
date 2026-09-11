@@ -236,6 +236,9 @@ class MainWindow(QDialog, Ui_Dialog):
         # 切换开环/闭环时立即下发到单片机（不必再点“保存”）
         self.comboBox.currentIndexChanged.connect(self.on_mode_changed)
 
+        # 设置参数输入框的物理合理范围（修 99.99 上限问题）
+        self._init_param_ranges()
+
         # 设置“加载历史”标签页
         self.init_history_tab()
         #加载日志
@@ -244,6 +247,32 @@ class MainWindow(QDialog, Ui_Dialog):
         # 默认最大化（用户体验：开窗即占满屏幕，便于观察曲线和参数列）。
         # 也保留用户手动调整窗口尺寸的能力，setMinimumSize 已设为 1100x600。
         self.showMaximized()
+
+    def _init_param_ranges(self):
+        """为 4 个参数 QDoubleSpinBox 设置物理合理的输入范围。
+
+        wind_show.ui 里只创建控件、未设任何 setRange/singleStep/decimals，
+        全部走 Qt 默认 [-99.99, 99.99, step=1.0]——100 输不进去、风速也
+        不能超过 99.99，明显不够用。按风机物理约束分别设：
+          cut_in       (切入) 0.1 ~ 10     m/s，步长 0.1
+          rated_wind   (额定) 5   ~ 25     m/s，步长 0.5
+          cut_out      (切出) 10  ~ 40     m/s，步长 0.5   (与额定有重叠避免卡)
+          rated_power  (功率) 0.1 ~ 999.9  kW，步长 0.1   ← 修 #99.99 上限问题
+        说明：cut_out 下限设 10（小于 rated_wind 上限），让用户输参时容许
+        反向调整，但 save_params 会再做 cut_in ≤ rated ≤ cut_out 校验。
+        """
+        self.doubleSpinBox.setRange(0.1, 10.0)        # 切入风速
+        self.doubleSpinBox.setDecimals(1)
+        self.doubleSpinBox.setSingleStep(0.1)
+        self.doubleSpinBox_2.setRange(5.0, 25.0)      # 额定风速
+        self.doubleSpinBox_2.setDecimals(1)
+        self.doubleSpinBox_2.setSingleStep(0.5)
+        self.doubleSpinBox_3.setRange(10.0, 40.0)     # 切出风速
+        self.doubleSpinBox_3.setDecimals(1)
+        self.doubleSpinBox_3.setSingleStep(0.5)
+        self.doubleSpinBox_4.setRange(0.1, 999.9)     # 额定功率（修复 99.99 上限）
+        self.doubleSpinBox_4.setDecimals(2)
+        self.doubleSpinBox_4.setSingleStep(0.1)
 
     def _on_server_poll_tick(self):
         if not (self.serial_thread and self.serial_thread.isRunning()):
