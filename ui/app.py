@@ -27,25 +27,36 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# 关键路径: matplotlib 冷启动 ~770ms (中文环境更慢),
+# 过去在 curve_view.py module-level import 会让 MainWindow __init__ 阻塞
+# 等到这一大块才返回, 用户看不到任何东西, 主观感受是"卡死了"。
+# 修复: 在 ui/app.py 顶部延迟导入 matplotlib, MainWindow 构造期间完全不
+# 接触 matplotlib, 窗口先 show() 显示给用户, 然后下一个事件循环里再异步
+# 实例化 CurveView 并替换占位 QLabel。视觉延迟从 ~1.2s 降到 <0.2s。
+# (2026-09-10 修)
+def _lazy_curve_view(window_sec: int):
+    """第一次调用时 import matplotlib + 实例化 CurveView。"""
+    from ui.widgets.curve_view import CurveView
+    return CurveView(window=window_sec)
+
 # 双模式导入: python -m ui.app 走相对导入; python ui/app.py 直接跑也支持
+# 注意: curve_view 和 hist_view 含 matplotlib (~770ms 冷启动), 不在顶层 import,
+# 改走 _lazy_curve_view() / hist_view dock 第一次显示时再 import, 否则前面
+# 写的"窗口先 show 出来"优化就白做了。(2026-09-10)
 if __package__ in (None, ""):
     sys.path.insert(0, str(ROOT))
     from ui import db, theme
     from ui.widgets.rtu_view import RtuView
-    from ui.widgets.curve_view import CurveView
     from ui.widgets.sim_ctrl import SimCtrl
     from ui.widgets.dev_params import DevParams
     from ui.widgets.scada_table import ScadaTable
-    from ui.widgets.hist_view import HistView
     from ui.widgets.log_view import LogView
 else:
     from . import db, theme
     from .widgets.rtu_view import RtuView
-    from .widgets.curve_view import CurveView
     from .widgets.sim_ctrl import SimCtrl
     from .widgets.dev_params import DevParams
     from .widgets.scada_table import ScadaTable
-    from .widgets.hist_view import HistView
     from .widgets.log_view import LogView
 
 STATE_TEXT = {0: ("仿真停止", theme.RED), 1: ("仿真运行", theme.GREEN),
@@ -71,13 +82,22 @@ class MainWindow(QMainWindow):
 
         split = QSplitter(Qt.Horizontal)
         self._rtu = RtuView()
-        self._curve = CurveView(window=240)
+        # 占位 QLabel: matplotlib 没初始化完之前, 用户能立刻看到 RTU 卡片
+        # 和控制台 / SCADA 表, 不会盯着空白主窗口等。下一个事件循环再换。
+        self._curve_placeholder = QLabel("环境/功率曲线 · 初始化中…")
+        self._curve_placeholder.setAlignment(Qt.AlignCenter)
+        self._curve_placeholder.setStyleSheet("color: %s; font-size: 14px;"
+                                               % theme.SUB)
         split.addWidget(self._rtu)
-        split.addWidget(self._curve)
+        split.addWidget(self._curve_placeholder)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
         split.setSizes([460, 1000])
         v.addWidget(split, 1)
+
+        # 异步实例化 CurveView (matplotlib 773ms 在这里才发生, 不再阻塞 UI)
+        self._curve = None
+        QTimer.singleShot(0, self._mount_curve)
 
         self._build_docks()
         self._build_menus()
@@ -117,6 +137,64 @@ class MainWindow(QMainWindow):
         h.addWidget(self._chip_state)
         return bar
 
+    def _mount_curve(self):
+        """异步挂载 CurveView。matplotlib 773ms 冷启动在这里发生, 但 UI
+        早已 visible, 用户看到的是"占位符 → 真实曲线"的平滑过渡。
+        """
+        t = time.perf_counter()
+        self._curve = _lazy_curve_view(window_sec=240)
+        # 把占位换成真曲线, 保留 splitter 比例
+        split = self._curve_placeholder.parentWidget()
+        idx = split.indexOf(self._curve_placeholder)
+        split.replaceWidget(idx, self._curve)
+        self._curve_placeholder.deleteLater()
+        self._curve_placeholder = None
+        # 立刻拿当前库数据补一笔, 不等下一秒定时器
+        try:
+            self._curve.refresh(db.recent_sim(self._curve.window_sec))
+        except Exception:
+            pass
+        # 拖拽结束 -> 实时反馈到 status bar(成功/越界/历史/暂停 4 种)
+        # 之前只画 marker, 用户常常"看不到黄点以外的变化"——其实是信号被吞了
+        self._curve.envEdited.connect(self._on_env_edited)
+        ms = (time.perf_counter() - t) * 1000
+        self.statusBar().showMessage(
+            "数据源 grid.db · 曲线已就绪 (%dms) · 最近更新 %s"
+            % (int(ms), time.strftime("%H:%M:%S")))
+
+    def _on_env_edited(self, payload):
+        """CurveView 拖拽结束的反馈: ('ok'|'warn', msg)。
+        ok   -> 绿色 5 秒
+        warn -> 红色 8 秒(更醒目, 提示用户操作无效)"""
+        kind, msg = payload[0], payload[1]
+        if kind == "ok":
+            self.statusBar().setStyleSheet("color: #2ecc71;")
+            self.statusBar().showMessage(msg, 5000)
+        else:
+            self.statusBar().setStyleSheet("color: #e74c3c;")
+            self.statusBar().showMessage(msg, 8000)
+        # 下一轮 _tick 时 statusBar 会刷成默认"每秒刷新"消息, 把颜色盖回去
+
+    def _ensure_hist(self):
+        """历史曲线面板按需实例化: matplotlib 二次冷启动 770ms, 藏到用户
+        点 SCADA 历史曲线 tab 时才发生。"""
+        if self._hist is not None:
+            return
+        # 第二次 matplotlib 冷启动已经在 _mount_curve 时发生, 这次 import
+        # 实际很快(sys.modules 命中)
+        from ui.widgets.hist_view import HistView
+        self._hist = HistView()
+        self._dock_hist.setWidget(self._hist)
+        try:
+            self._hist._query()
+        except Exception:
+            pass
+
+    def _on_hist_visibility(self, visible):
+        """dock 第一次显示时实例化 widget(避开 matplotlib 冷启动)。"""
+        if visible:
+            self._ensure_hist()
+
     # ---------------- 功能面板 (QDockWidget) ----------------
     def _mk_dock(self, title: str, widget, area) -> QDockWidget:
         d = QDockWidget(title, self)
@@ -132,16 +210,21 @@ class MainWindow(QMainWindow):
         self._scada = ScadaTable()
         self._log   = LogView()
         self._dev   = DevParams()
-        self._hist  = HistView()
+        # 历史曲线: 第一次切到 tab 时才实例化 (matplotlib 二次冷启动 770ms)
+        self._hist  = None
         dock_scada = self._mk_dock("SCADA 实时表", self._scada,
                                    Qt.BottomDockWidgetArea)
         dock_log = self._mk_dock("运行日志", self._log,
                                  Qt.BottomDockWidgetArea)
         dock_dev = self._mk_dock("设备参数", self._dev,
                                  Qt.BottomDockWidgetArea)
-        dock_hist = self._mk_dock("SCADA 历史曲线", self._hist,
-                                  Qt.BottomDockWidgetArea)
-        for d in (dock_log, dock_dev, dock_hist):
+        self._dock_hist = QDockWidget("SCADA 历史曲线", self)
+        self._dock_hist.setObjectName("SCADA 历史曲线")
+        self._dock_hist.setAllowedAreas(Qt.AllDockWidgetAreas)
+        self._dock_hist.visibilityChanged.connect(self._on_hist_visibility)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self._dock_hist)
+        self._docks["SCADA 历史曲线"] = self._dock_hist
+        for d in (dock_log, dock_dev, self._dock_hist):
             self.tabifyDockWidget(dock_scada, d)
         dock_scada.raise_()
 
@@ -190,21 +273,24 @@ class MainWindow(QMainWindow):
         表/日志全部同步清空+回填, 而不是最坏 1 秒后才看到(像"卡住")。
         """
         # 曲线: 历史已清 -> 立刻看到"等待仿真数据…"
-        try:
-            self._curve.refresh(db.recent_sim(self._curve.window_sec))
-        except Exception:
-            pass
+        # (曲线可能在 matplotlib 冷启动 773ms 期间还未挂上, 容忍 None)
+        if self._curve is not None:
+            try:
+                self._curve.refresh(db.recent_sim(self._curve.window_sec))
+            except Exception:
+                pass
         # 底部四个面板: 各 _reload 一次
         for w in (self._scada, self._log, self._dev):
             try:
                 w._reload()
             except Exception:
                 pass
-        # 历史曲线面板: 仅当有勾选时才重画(无勾选调 _query 会清掉提示)
-        try:
-            self._hist._query()
-        except Exception:
-            pass
+        # 历史曲线面板: 仅当已实例化时才重画(没切过 tab, _hist 还是 None)
+        if self._hist is not None:
+            try:
+                self._hist._query()
+            except Exception:
+                pass
 
     # ---------------- 刷新 ----------------
     def _tick(self):
@@ -232,7 +318,9 @@ class MainWindow(QMainWindow):
             col, "#2a2438" if st == 1 else "#3a1420"))
 
         self._rtu.refresh(yc, yx)
-        self._curve.refresh(rows)
+        # 曲线 matplotlib 冷启动期间 self._curve 可能还是 None, 容忍
+        if self._curve is not None:
+            self._curve.refresh(rows)
 
         self._last_refresh = time.strftime("%H:%M:%S")
         self.statusBar().showMessage(

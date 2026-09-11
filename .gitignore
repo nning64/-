@@ -2,6 +2,10 @@
 grid.db
 grid.db-shm
 grid.db-wal
+# 截图文件
+ui/_selftest.png
+ui/preview.png
+ui/_shot_*.png
 
 # Python 缓存
 __pycache__/

@@ -85,7 +85,7 @@ def dg_params(cur):
 
 def write_realtime(cur, wind, load_kw, wt_act, wt_pitch, wt_run, wt_avail,
                    wt_ack, dg_act, dg_run, unbalance, dg_p,
-                   dg_ack=0.0):
+                   dg_ack=0.0, sim_state=1):
     """把这一秒的全网状态, 按点表逐点写进 yc_realtime(11行) / yx_realtime(8行)。
     wt_avail: 可用功率(A 按风功率曲线自算, MPPT 上限)
     wt_ack  : R01:5 功率设定回显值(见主循环处说明)
@@ -121,7 +121,7 @@ def write_realtime(cur, wind, load_kw, wt_act, wt_pitch, wt_run, wt_avail,
         ('R01', 2, 0),        # 风机故障标志 (0正常)
         ('R02', 1, dg_run),   # 柴发运行状态
         ('R02', 2, 0),        # 柴发告警   (0正常)
-        ('R03', 1, 1),        # 仿真运行状态 (1=运行中)
+        ('R03', 1, sim_state), # 仿真运行状态 (0停/1运/2暂停) — 跟随 sim_state, 不再硬编码 1
     ]
     # updated_at 走表默认值(真实本地时间), 覆盖写后自动刷新
     cur.executemany(
@@ -531,14 +531,19 @@ def run_loop(scenario=None, speed=1.0, until=None, comm=False, port=9000,
             # 7. 刷新当前值表 (公告栏, 给 B 的 EMS 拉数据用)
             #    R02:2 柴发功率回显: EMS 下发过 YT(DG_P_SET_CMD) -> 回显指令值;
             #    没下发 -> 回显系统目标 dg_sp(EMS 没指令时 A 就地补缺的目标),
-            #    这样 R02:2 永远有值, 配合 R02:1(实发)便于看出"目标 vs 实发"偏差。
-            dg_ack = (cexe.s['dg_set']
-                      if cexe.s['dg_set'] is not None
-                      else dg_sp)
+            #    但 dg_sp 可能是负的(风机出力 > 负荷), 此时不能回显负数 —— 柴发
+            #    不能关(必须保 p_min=30 最低稳定燃烧), 所以钳到 dg_tb.p_min。
+            #    这样 R02:2 永远在 [p_min, p_max] 内, 配合 R02:1(实发)便于看出
+            #    "目标 vs 实发"偏差。 (2026-09-10 修)
+            if cexe.s['dg_set'] is not None:
+                dg_ack = cexe.s['dg_set']
+            else:
+                dg_ack = max(dg_tb.p_min, dg_sp)
             yc_rows, yx_rows = write_realtime(
                 cur, wind, load_kw, wt_act, wt_pitch, wt_run, wt_avail,
                 wt_ack, dg_act, dg_run, unbalance, dg_p,
                 dg_ack=dg_ack,
+                sim_state=cur_state,
             )
             # 7b. 变位记账 (越过死区/状态变化才往历史账本追加一条)
             hrec.yc_step(cur, yc_rows, sim_time)

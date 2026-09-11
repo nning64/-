@@ -80,7 +80,7 @@ def check_one(csv_path):
         bad = [r for r in yc if r[2] is None or r[3] != 0]
         if bad:
             results.append(('② 公告栏遥测 11 点齐全', False,f'{len(bad)} 个点坏值/空值: {bad[:3]}'))
-         else:
+        else:
             results.append(('② 公告栏遥测 11 点齐全', True, '全有值, 质量全好'))
 
     # ③ 量程: 逐点对照点表, UNBAL(R03-2) 例外只提醒
