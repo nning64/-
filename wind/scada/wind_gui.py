@@ -379,6 +379,10 @@ class MainWindow(QDialog, Ui_Dialog):
           → 仿真刚启动时（live_times[0]=30, latest=30）起点=30，不会出现负值
           → 仿真跑久后起点=latest-600，窗口自然滚动
         - 终点 = latest + 5（留 5 秒缓冲避免曲线贴边）
+        - **最小窗口 60 秒**：新段刚起 / 刚 reset 完 / 数据只有几个点时，
+          不至于把 X 轴压成 5 秒宽导致曲线"看不见"（用户体感是"曲线停了"）。
+          当 [x_min, x_max] 跨度 < 60s 时，把 x_max 拉到 x_min + 60
+          （左侧留白，让新数据有地方画，避免视觉上像空图）。
         - 早于起点的点不裁剪，但 X 轴只显示 [x_min, x_max]，pyqtgraph 自动裁。
         """
         if not self.live_times:
@@ -391,6 +395,9 @@ class MainWindow(QDialog, Ui_Dialog):
         # 起点：要么从缓存最早点起（仿真刚跑不久），要么最近 10 分钟（已跑久）
         x_min = max(earliest, latest - self.live_window_seconds)
         x_max = latest + 5
+        # 新段刚起 / reset 后只 1 个点：撑到最小窗口 60s，避免"曲线停了"的体感
+        if x_max - x_min < 60:
+            x_max = x_min + 60
         for plot in (self.plot_wind, self.plot_power, self.plot_pitch):
             plot.setXRange(x_min, x_max, padding=0.02)
 
@@ -1219,9 +1226,12 @@ class MainWindow(QDialog, Ui_Dialog):
                     pass  # 重复帧，跳过
                 elif ts < self.live_times[-1]:
                     # ts 回退 = A 重启，重置 live 缓存（seed 旧段作废）
-                    self.status_updated.emit(
-                        f"[INFO] 检测到 A 端 sim_time 回退 {self.live_times[-1]:.0f}→{ts:.0f}，"
-                        f"曲线重置从新段开始"
+                    # status_updated 是 SerialReceiverThread 的信号，MainWindow 没有
+                    # 这个属性。MainWindow 上对应入口是 on_serial_status(msg)，
+                    # 它会把 [INFO]/[WARN]/[ERROR] 前缀的消息打到 label_21。
+                    self.on_serial_status(
+                        f"[INFO] 检测到 A 端 sim_time 回退 "
+                        f"{self.live_times[-1]:.0f}→{ts:.0f}，曲线重置从新段开始"
                     )
                     self.live_times = [ts]
                     self.live_winds = [wind]
