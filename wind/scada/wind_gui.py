@@ -191,6 +191,16 @@ class MainWindow(QDialog, Ui_Dialog):
         # 服务器 IP/端口设置控件（评分表 34 项，动态加到参数面板第三行）
         self.init_server_ip_controls()
 
+        # 周期轮询固件当前服务器（评分表 34 项兜底）：
+        # get_server 一次性的查询（串口连上后 0.5s/4.5s）如果赶上固件阻塞
+        # 联网就超时翻车，之后再也没人刷新——"当前服务器"会卡在"待固件上报"
+        # 或"正在连接"。这里每 10s 查一次（用 2s 短超时防 GUI 卡顿），是状态
+        # 行解析失败/错过时的兜底保障。
+        self._server_poll_timer = QTimer(self)
+        self._server_poll_timer.setInterval(10000)
+        self._server_poll_timer.timeout.connect(self._on_server_poll_tick)
+        self._server_poll_timer.start()
+
         # "单片机回显验证"常驻显示行（评分表 35 项）：加在 groupBox_2 只读
         # 参数栏第 8 行（gridLayout_9 已有 7 行，label_28~43）
         self.mcu_echo_caption = QLabel("单片机回显验证")
@@ -234,6 +244,11 @@ class MainWindow(QDialog, Ui_Dialog):
         # 默认最大化（用户体验：开窗即占满屏幕，便于观察曲线和参数列）。
         # 也保留用户手动调整窗口尺寸的能力，setMinimumSize 已设为 1100x600。
         self.showMaximized()
+
+    def _on_server_poll_tick(self):
+        if not (self.serial_thread and self.serial_thread.isRunning()):
+            return  # 串口未连，query 没意义
+        self._query_fw_server(quiet=True)
 
     # 初始化曲线
     def init_plots(self):
@@ -835,17 +850,20 @@ class MainWindow(QDialog, Ui_Dialog):
         时间进入读循环，避免阻塞启动画面。"""
         QTimer.singleShot(500, self._do_post_connect_sync)
 
-    def _query_fw_server(self):
+    def _query_fw_server(self, quiet=False):
         """向固件查询当前实际使用的服务器地址（get_server 命令）。
 
         场景：固件开机联网时打的 "TCP -> ip:port" 行，通常在 GUI 连上串口
         之前就发过去了——界面"当前服务器"会一直停在"待固件上报"。
         每次串口连接成功后主动查一次，把固件此刻真正在用的地址显示出来，
         顺带回填 IP 输入框（在此基础上改地址比从空白敲方便）。
+        quiet=True 用于周期轮询场景：查询失败（固件正在重连/暂停主循环）
+        时不刷日志，避免日志屏爆。
         返回 (ip, port)；查询失败返回 (None, None)。"""
         fw_ip, fw_port = None, None
         try:
-            ok, detail, ack = self._send_config_cmd({"cmd": "get_server"}, return_ack=True)
+            ok, detail, ack = self._send_config_cmd(
+                {"cmd": "get_server"}, return_ack=True, timeout=2.0)
             if ok and isinstance(ack, dict) and ack.get("ip"):
                 fw_ip = str(ack["ip"])
                 fw_port = int(ack.get("port") or 0)
@@ -861,9 +879,11 @@ class MainWindow(QDialog, Ui_Dialog):
                 self.log(f"✅ 固件当前服务器: {fw_ip}:{fw_port}"
                          f"（{'链路在线' if online else '链路未建立'}）")
             else:
-                self.log(f"⚠️ 查询固件服务器地址: {detail}")
+                if not quiet:
+                    self.log(f"⚠️ 查询固件服务器地址: {detail}")
         except Exception as e:
-            self.log(f"⚠️ 查询固件服务器地址失败: {e}")
+            if not quiet:
+                self.log(f"⚠️ 查询固件服务器地址失败: {e}")
         return fw_ip, fw_port
 
     def _do_post_connect_sync(self):
@@ -991,6 +1011,11 @@ class MainWindow(QDialog, Ui_Dialog):
         if "正在连接 TCP 服务器" in body:
             addr = body.split("正在连接 TCP 服务器", 1)[1].strip() or addr
             self._set_link_server(addr, "正在连接…", "orange")
+        elif "通信链路就绪" in body or "已在服务器完成注册" in body or "TCP 已连接服务器" in body:
+            # TCP OK / REG OK / Transparent Mode —— 首次连接成功路径
+            # （WiFi_Init 不会打 RECONNECT OK，硬复位恢复也走这条）。
+            # 之前漏了这三个分支，"正在连接…"翻不了绿、永远卡住。
+            self._set_link_server(addr or "未知地址", "已连接并完成注册 ✓", "#26a269")
         elif "链路已恢复" in body:
             self._set_link_server(addr or "未知地址", "链路已恢复并完成注册 ✓", "#26a269")
         elif "重连失败" in body:
@@ -1146,7 +1171,9 @@ class MainWindow(QDialog, Ui_Dialog):
         print(message)
     def closeEvent(self, event):
         """窗口关闭时停止线程"""
-        self.timer.stop()
+        for t in ('timer', '_server_poll_timer'):
+            if hasattr(self, t) and hasattr(getattr(self, t), 'stop'):
+                getattr(self, t).stop()
         if self.serial_thread and self.serial_thread.isRunning():
             self.serial_thread.stop()
         self.db.close()
