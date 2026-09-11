@@ -92,11 +92,21 @@ class GridSimServer:
         self._last_heart = 0.0
         self._last_push = 0.0
         self._running = True
+        # "指令入队"日志去重: B/C 常每秒重发同一设定值, 同一条指令 5 秒内
+        # 只写一次 log 表(终端仍每次都打印)。(2026-09-11)
+        self._cmd_sig = None
+        self._cmd_sig_t = 0.0
 
     # ---------- 小工具 ----------
-    def log(self, level, msg):
+    def log(self, level, msg, to_db=True):
+        """打日志。level=DEBUG 或 to_db=False 时只打印终端, 不写 log 表。
+
+        to_db=False 用于"内容完全相同的重复事件"(如 B/C 每秒重发同一个设定
+        值): 终端照常打印看得到活动, 但不去灌 log 表 —— 之前 20 分钟就能往
+        库里堆 2 万条一模一样的"指令入队"记录。(2026-09-11)
+        """
         print('[%s] [%-5s] %s' % (_ts_now(), level, msg), flush=True)
-        if level != 'DEBUG':                 # DEBUG 心跳那种高频噪音不入库
+        if level != 'DEBUG' and to_db:       # DEBUG 心跳那种高频噪音不入库
             db_log(level, 'SERVER', msg, db=self.db)
 
     def _read_sim_time(self):
@@ -524,8 +534,14 @@ class GridSimServer:
         self._send(conn, {'code': 'ACK', 'ts': now_ms(), 'src': 'GRID_SIM',
                           'data': {'rtu': rtu, 'type': typ, 'pt': pt,
                                    'state': 'OK', 'val': cmd}})
-        self.log('INFO', '指令入队: %s -> %s %s pt%s = %s'
-                 % (src, rtu, typ, pt, cmd))
+        # 同一条指令 5s 内重复到达 -> 终端打印 + "(重复, 不写库)"
+        sig = (src, rtu, typ, pt, cmd)
+        now_s = time.time()
+        dup = (sig == self._cmd_sig and now_s - self._cmd_sig_t < 5.0)
+        self._cmd_sig, self._cmd_sig_t = sig, now_s
+        self.log('INFO', '指令入队: %s -> %s %s pt%s = %s%s'
+                 % (src, rtu, typ, pt, cmd, ' (重复,不写库)' if dup else ''),
+                 to_db=not dup)
 
     # ---------- P2-3: 通信状态灯 ----------
     # 三个 YX 点由总机按"谁在线"维护, main.py 只保底建行(0)不覆盖:

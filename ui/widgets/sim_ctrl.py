@@ -11,8 +11,8 @@
 - start 时 UI 立刻清空历史表(sim_history/yc_history/yx_history),
   曲线/SCADA 表/历史曲线面板立即变"等待…", 视觉反馈即时; main 接
   start 命令下一帧开始写新数据, 曲线自然跟着动。
-- start 时把 sim_start_s 钳在 env_curve 周期内(否则 180 秒窗口里
-  全是同一段环境值循环, 看着像"卡住")。
+- start 时 sim_start_s 原样下发(不再按场景周期折回): 主循环
+  env_curve_lookup 内部自动取模, 任意起始 sim_time 都合法。
 - 每次按钮按下后通过 command_issued 信号通知其他面板立即刷新,
   不必等定时器(按下到看到曲线动之间最多 100ms 而非 1s)。
 - 命令发出 3 秒仍未消费 -> 状态变红"主程序未跑"。
@@ -46,10 +46,18 @@ class SimCtrl(QWidget):
         self._sync = False       # 程序自己 setValue 时置 True, 不算用户编辑
         self._cmd_since = None   # ctrl_cmd 发出后未被消费的起始时刻(秒)
         self._last_start = 0.0   # 上次"启动"按下时刻(秒) —— 连点防抖
+        self._clock_t = None     # 秒表已显示到哪一秒(只归 _tick_clock 管)
         self._build()
         self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.PreciseTimer)
         self._timer.timeout.connect(self._refresh)
         self._timer.start(1000)
+        # 秒表(当前时刻)单独 20Hz 刷新: 挂在上面那条 1Hz 上会和 main 的
+        # 每秒推进错拍, 显示成 +1/+0/+2 乱跳。详见 _tick_clock。
+        self._clock = QTimer(self)
+        self._clock.setTimerType(Qt.PreciseTimer)
+        self._clock.timeout.connect(self._tick_clock)
+        self._clock.start(50)
         self._refresh()
 
     def _build(self):
@@ -155,20 +163,11 @@ class SimCtrl(QWidget):
             return
         self._last_start = _now
 
-        # 0) 先钳位: 起始时刻超过场景长度时, 折回到 0~period-1 之间,
-        #    否则 180 秒窗口里全是同一段环境值循环 -> 看着"卡住"
+        # 0) 起始时刻原样下发, 不折回: 主循环按 env_curve 周期自动取模
+        #    (loop 模式), 用户想从任意 sim_time 起步都合法, 不再被钳位。
+        #    (早期版本会把 start >= period 折回, 导致滑块超过周期上限就
+        #     "只能调到 period-1", 现已移除该限制。)
         start = self._sp_start.value()
-        period = db.scenario_period()
-        clamp_note = ""
-        if period > 0 and start >= period:
-            new_start = start % period
-            clamp_note = ("(原 %ds 超出场景长度 %ds, 已折回为 %ds) "
-                          % (start, period, new_start))
-            start = new_start
-            self._sync = True
-            self._sp_start.setValue(start)
-            self._dirty.discard("sim_start_s")
-            self._sync = False
 
         # 1) UI 自己立刻清空历史表(不等 main): 曲线/SCADA/历史面板
         #    立即变空, 视觉反馈即时; main 接 start 后下一帧开始写新数据
@@ -181,9 +180,9 @@ class SimCtrl(QWidget):
 
         # 3) 下发 start 命令
         db.send_ctrl("start")
-        self._say("已下发: 启动 (起始=%ds, 结束=%ds, 步长=%ds) %s%s"
+        self._say("已下发: 启动 (起始=%ds, 结束=%ds, 步长=%ds) %s"
                   % (self._sp_start.value(), self._sp_end.value(),
-                     self._sp_step.value(), clamp_note, clear_note))
+                     self._sp_step.value(), clear_note))
         self.command_issued.emit("start")
 
     def _apply(self, quiet=False):
@@ -201,6 +200,22 @@ class SimCtrl(QWidget):
     def _say(self, text):
         self._lbl_msg.setText("%s  [%s]"
                               % (text, time.strftime("%H:%M:%S")))
+
+    def _tick_clock(self):
+        """只刷"当前时刻"秒表 t = Ns(20Hz)。
+
+        main.py 每 1.000s 精确 +1, 而 _refresh 也是每 1.000s 才读一次库,
+        两个同频周期互相错拍 -> 显示会 +1/+0/+2 乱跳(既不是匀速, 也不是
+        一格一格)。这里用 20Hz 只读一个 sim_time, 保证每个新值恰好显示
+        一次、且不跳号。
+        """
+        try:
+            t = int(db.sim_params_all().get("sim_time", 0) or 0)
+        except Exception:
+            return
+        if t != self._clock_t:
+            self._clock_t = t
+            self._lbl_time.setText("t = %ds" % t)
 
     def _refresh(self):
         try:
@@ -237,7 +252,8 @@ class SimCtrl(QWidget):
                 self._stall = 0.0
         self._last_t, self._last_rt = t, now
 
-        self._lbl_time.setText("t = %ds" % t)
+        # 注: 秒表 t = Ns 不在这里刷 —— 由 _tick_clock 以 20Hz 单独驱动
+        # (1Hz 采样会漏值/错拍)。这里只负责下面的停滞判断和状态胶囊。
         text, col = _ST.get(st, _ST[0])
         if no_consumer:
             text, col = "主程序未跑!", theme.RED

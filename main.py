@@ -236,7 +236,9 @@ class CommandExecutive:
         #   wt_p_set: 风机限功率 kW (None = 不限, 按风速满发 MPPT)
         #   wt_pitch_set: C 桨距设定 deg (None = C 未下发过 -> A 自演)
         #   wt_pitch_ts : 最近一次执行 C YT2 的墙钟时刻(None=从未), 判 C 在线用
-        #   dg_set  : 柴发目标 kW   (None = 就地补缺 负荷-风机)
+        #   dg_set  : EMS 下发的柴发遥调目标 kW (仅供收单/展示;
+        #             自 2026-09-11 起不作为出力, 出力由 A 按 负荷-风机 就地
+        #             计算, 决策权归 A) —— YT_MAP 里仍保留以便指令进历史
         self.s = {'wt_start': None, 'dg_run': None,
                   'wt_p_set': None, 'wt_pitch_set': None,
                   'wt_pitch_ts': None, 'dg_set': None}
@@ -299,11 +301,8 @@ def _apply_ctrl(cur, period):
     set_param(cur, 'ctrl_cmd', '')          # 消费掉, 防止重复执行
     if cmd == 'start':
         start = int(get_param(cur, 'sim_start_s', '0') or 0)
-        # 钳位: 起始超出场景周期则折回, 避免 180s 窗口里全是同一段
-        # 环境值循环 -> UI 看着"卡住"。period 由主循环计算后传入。
-        if period and start >= period:
-            start = start % period
-            set_param(cur, 'sim_start_s', str(start))
+        # 起始时刻原样使用: env_curve_lookup 内部按 period 取模, 即使
+        # start >= period 也能正确取场景值(loop 模式), 无需在此折回。
         # 清历史(与 UI 协调: UI 已清一次, 此处再清一次防漏, 用户
         # 视觉上 ms 级无感)。UI 清空 + main 清空, 任何顺序都安全。
         for tbl in ('sim_history', 'yc_history', 'yx_history'):
@@ -397,6 +396,19 @@ def run_loop(scenario=None, speed=1.0, until=None, comm=False, port=9000,
     hrec  = HistoryRecorder(cur)  # 一位"记得住每个点上次记了啥"的记账员, 同上
     cexe  = CommandExecutive()    # 一位"听 EMS 指令"的执行员, 同上 (P2-3)
     sim_time = int(get_param(cur, 'sim_time', '0'))
+
+    # ---- 节奏基准(2026-09-11 修"流速不均匀"):
+    #     旧实现"先 sleep(1.0/speed) 再 work"会让工作耗时叠加在节奏上,
+    #     speed 越大偏差越大 (10x 时 25ms 工作 = 25% 抖动) 且 work 抖动
+    #     直接变成倍速漂移。改为"目标时间驱动":
+    #     记录 next_deadline = 下一帧应该跑的真实时刻; 每帧等到它(已晚
+    #     则不补睡) -> work -> sim_time += step -> deadline += frame_dt。
+    #     work 多久都不影响节奏, 整体累计偏差趋近 0; pause / 重新 start
+    #     / 改 speed 都要以"现在"重置 deadline, 否则会试图"追回"暂停时间。
+    speed_base = max(speed, 1e-9)
+    frame_dt   = 1.0 / speed_base       # 一帧 = 1.0/speed 真实秒
+    next_deadline = time.perf_counter() + frame_dt
+    prev_running  = True                # 上一帧是否处于运行态 (1)
     started  = time.time()
     db_log('INFO', 'MAIN',
            '仿真启动 sim=%ss speed=%sx until=%s' % (sim_time, speed, until))
@@ -425,6 +437,8 @@ def run_loop(scenario=None, speed=1.0, until=None, comm=False, port=9000,
 
     last_print_t = -1
     c_ctl_prev = False      # 上一帧 C 是否接管桨距(只在切换时打一行日志)
+    last_yx_state = None    # 已写进 R03:1 的仿真状态(只在变化时才写, 见下)
+    last_cmd_log = {}       # (src,typ,rtu,pt,val) -> 上次入 log 表的时刻(去重)
     try:
         while True:
             # 0. 消费"仿真控制"命令(UI 下发的 ctrl_cmd) —— 冻结时也得听
@@ -435,32 +449,50 @@ def run_loop(scenario=None, speed=1.0, until=None, comm=False, port=9000,
             sim_time = int(get_param(cur, 'sim_time', '0') or 0)
             cur_step  = int(get_param(cur, 'sim_step_s', '1') or 1)
             cur_state = int(get_param(cur, 'sim_state', '1') or 1)
+
+            # 0.5 状态灯 R03:1 (SIM_RUN) 无条件同步 —— 运行/暂停/停止三种状态
+            #     都要落进 yx_realtime。旧实现只在"运行帧"的 write_realtime 里
+            #     写它, 一旦按了暂停/停止, 这个点就再也不更新, UI 顶部/左栏
+            #     一直亮着绿灯"仿真运行", 而 t 和曲线全冻住 —— 用户会以为
+            #     "界面卡死、数据不刷新"。只在实际变化时写, 不空转写库。
+            #     (2026-09-11 修)
+            if cur_state != last_yx_state:
+                cur.execute(
+                    "UPDATE yx_realtime SET value=?, "
+                    "updated_at=datetime('now','localtime') "
+                    "WHERE rtu_id='R03' AND point_no=1", (cur_state,))
+                last_yx_state = cur_state
+
             if cur_state != 1:
                 # 暂停(2)/停止(0): 冻结不推进, 只轮询控制命令
                 time.sleep(0.2)
+                prev_running = False
                 continue
 
-            # 1. 真实等待: 固定"每帧时长"=1.0/speed 秒(1x=每秒一帧)。
-            #    sim_step_s 只决定"每帧推进多少仿真秒"(= 快进倍率), 与真实
-            #    等待无关 —— 调大步长是"快进", 不是"卡死"。旧逻辑曾用
-            #    cur_step/speed 当等待时长: 步长>3 时 sim_time 每 N 秒才动一次,
-            #    UI 每秒轮询会误判"主程序未跑"(红绿闪烁)。(2026-09-08)
-            #    分片睡(每片<=0.1s): 等待途中来了控制命令(pause/stop/start)
-            #    立刻醒来回循环头消费, 大步长也能秒级响应命令。
-            interrupted = False
-            if speed <= 0:
-                time.sleep(0)   # 全速
-            else:
-                left = 1.0 / speed
-                while left > 0:
-                    piece = min(0.1, left)
-                    time.sleep(piece)
-                    left -= piece
-                    if left > 0 and get_param(cur, 'ctrl_cmd', ''):
-                        interrupted = True
-                        break
-            if interrupted:
-                continue        # 本帧时间不推进, 立刻去消费命令
+            # 1.0 状态/速度变化时重锚: next_deadline 以"现在"为新基准,
+            #     否则会试图"追回"暂停期间没推进的时间, 或把 speed 改小后
+            #     还按旧 frame_dt 跳。变量在循环外初始化; 此处每帧检测一次。
+            cur_running = (cur_state == 1 and speed > 0)
+            speed_now   = float(speed)
+            if cur_running and (not prev_running
+                                or abs(speed_now - speed_base) > 1e-9):
+                next_deadline = time.perf_counter() + frame_dt
+                speed_base = speed_now
+            prev_running = cur_running
+
+            # 1. 目标时间驱动: 等到 next_deadline(已晚则不补睡)
+            #    分片睡 <= 0.1s, 让 pause/start 命令能秒级打断。
+            if speed > 0:
+                while True:
+                    now = time.perf_counter()
+                    wait_s = next_deadline - now
+                    if wait_s <= 0:
+                        break                  # 到点了, 不补睡
+                    if get_param(cur, 'ctrl_cmd', ''):
+                        break                  # 中途来命令, 立即醒
+                    time.sleep(min(0.1, wait_s))
+                if wait_s <= 0 and not get_param(cur, 'ctrl_cmd', ''):
+                    next_deadline += frame_dt  # 正常推进到下一帧
 
             # 1.5 设备参数热重载(UI 改了 device_params, 下一帧就生效)
             #    同时拿回最新 dg_p 字典给 DG_LOAD 等每帧计算用
@@ -473,11 +505,19 @@ def run_loop(scenario=None, speed=1.0, until=None, comm=False, port=9000,
             wind, load_kw = env_curve_lookup(cur, sim_time, period)
 
             # 2.5. 先执行新到的指令(EMS/风机下发的 YK/YT), 变成对模型的约束
+            #      注意: EMS/C 常常"每秒重发同一个设定值"(如 R02 pt1=30.0),
+            #      若每次都写 log 表, 几分钟就能灌进几万条相同记录把库撑大。
+            #      终端 print 保留(方便看实时活动), 但 log 表对同一条命令
+            #      5 秒内只记一次。(2026-09-11 修)
             for src, typ, rtu, pt, val in cexe.poll(cur, sim_time):
                 print(f'  [CMD] {src} {typ} {rtu} pt{pt} = {val} -> 已执行')
-                db_log('INFO', 'MAIN',
-                       '执行 %s %s pt%s = %s (src=%s)'
-                       % (rtu, typ, pt, val, src))
+                sig = (src, typ, rtu, pt, val)
+                now_real = time.time()
+                if now_real - last_cmd_log.get(sig, 0.0) >= 5.0:
+                    last_cmd_log[sig] = now_real
+                    db_log('INFO', 'MAIN',
+                           '执行 %s %s pt%s = %s (src=%s)'
+                           % (rtu, typ, pt, val, src))
 
             # 2.75 桨距控制权判定(2026-09-09 开放 C 真实参与):
             #    C 最近 C_PITCH_HOLD_S 秒(真实时间)内持续发过 YT2 ->
@@ -508,9 +548,15 @@ def run_loop(scenario=None, speed=1.0, until=None, comm=False, port=9000,
             wt_ack = (cexe.s['wt_p_set'] if cexe.s['wt_p_set'] is not None
                       else wt_avail)
 
-            # 4. 柴发真实模型: 目标 = EMS 遥调给了就用指令值, 没给就地补缺(负荷-风机)
-            dg_sp = (cexe.s['dg_set'] if cexe.s['dg_set'] is not None
-                     else load_kw - wt_act)
+            # 4. 柴发决策权收归 A(2026-09-11 改):
+            #    EMS 下发的柴发遥调指令(dg_set)只"收单 + 进 yt_history 归档",
+            #    不再直接当作当前功率(四遥链路保留, UI 仍可见 EMS 下过什么)。
+            #    实际出力目标由 A 按实时功率就地计算 = 负荷 - 风机出力,
+            #    使每一刻 不平衡功率 = 负荷 - 风机 - 柴发 趋于 0
+            #    (受柴发 p_min/p_max 物理限制时才有残余不平衡: 如风>负荷时
+            #     柴发被钳在 p_min, 多余风功率需靠弃风/储能消纳, 本模型不含)。
+            #    风机设定功率(wt_p_set)维持 EMS 指令不变 —— 见步骤 3。
+            dg_sp = load_kw - wt_act
             dg_run_cmd = cexe.s['dg_run'] if cexe.s['dg_run'] is not None else 1
             dg_r = dg_tb.step(dg_sp, run_cmd=dg_run_cmd)
             dg_act, dg_run = dg_r['p_act'], dg_r['run']
@@ -535,10 +581,9 @@ def run_loop(scenario=None, speed=1.0, until=None, comm=False, port=9000,
             #    不能关(必须保 p_min=30 最低稳定燃烧), 所以钳到 dg_tb.p_min。
             #    这样 R02:2 永远在 [p_min, p_max] 内, 配合 R02:1(实发)便于看出
             #    "目标 vs 实发"偏差。 (2026-09-10 修)
-            if cexe.s['dg_set'] is not None:
-                dg_ack = cexe.s['dg_set']
-            else:
-                dg_ack = max(dg_tb.p_min, dg_sp)
+            # R02:2 功率设定回显: 现在永远回显 A 的实际调度目标(负荷-风机),
+            # 不再回显 EMS 指令; 负值(风>负荷)钳到 p_min 以免显示负数。
+            dg_ack = max(dg_tb.p_min, dg_sp)
             yc_rows, yx_rows = write_realtime(
                 cur, wind, load_kw, wt_act, wt_pitch, wt_run, wt_avail,
                 wt_ack, dg_act, dg_run, unbalance, dg_p,
@@ -575,6 +620,15 @@ def run_loop(scenario=None, speed=1.0, until=None, comm=False, port=9000,
         if server:
             server._running = False   # 通知总机线程收尾(daemon, 不强等, 随进程退出)
         set_param(cur, 'sim_state', '0')
+        # 退出时也必须把状态灯 R03:1 熄灭 —— 否则 UI 顶部/左栏会一直亮着
+        # 绿灯"仿真运行", 而仿真早停了(2026-09-11 修)
+        try:
+            cur.execute(
+                "UPDATE yx_realtime SET value=0, "
+                "updated_at=datetime('now','localtime') "
+                "WHERE rtu_id='R03' AND point_no=1")
+        except Exception:
+            pass
         db_log('INFO', 'MAIN', '仿真进程退出 sim=%ss' % sim_time)
         conn.close()
         print(f'\n仿真停止, sim_time={sim_time}s')
